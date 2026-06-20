@@ -2,3 +2,7 @@ torch>=1.13
 torchvision>=0.14
 numpy
 opencv-python
+
+# optional: enables the Albumentations pixel-level transforms (blur/CLAHE/gray).
+# the pipeline runs fine without it (those transforms become a no-op).
+# albumentations

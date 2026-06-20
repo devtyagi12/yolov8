@@ -5,9 +5,9 @@ from torch.utils.data import DataLoader
 from .dataset import YOLODataset
 
 
-def build_dataloader(path, imgsz=640, batch=16, augment=False, workers=4, shuffle=None, mosaic=1.0):
+def build_dataloader(path, imgsz=640, batch=16, augment=False, workers=4, shuffle=None, hyp=None, mosaic=None):
     """Create a ``DataLoader`` over a :class:`YOLODataset`."""
-    dataset = YOLODataset(path, imgsz=imgsz, augment=augment, mosaic=mosaic)
+    dataset = YOLODataset(path, imgsz=imgsz, augment=augment, hyp=hyp, mosaic=mosaic)
     if shuffle is None:
         shuffle = augment
     return DataLoader(

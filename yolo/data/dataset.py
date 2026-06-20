@@ -8,17 +8,18 @@ Expects the standard layout::
 The label path is derived from the image path by swapping ``/images/`` for
 ``/labels/`` and the extension for ``.txt`` (identical to the Ultralytics
 convention), so existing YOLO datasets work unchanged.
+
+Augmentation is delegated to the transform pipeline in :mod:`yolo.data.augment`
+(``v8_transforms``), matching the Ultralytics architecture.
 """
 
-import random
 from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
 from torch.utils.data import Dataset
 
-from ..data.augment import augment_hsv, build_mosaic, letterbox, xywhn2xyxy, xyxy2xywhn
+from ..data.augment import DEFAULT_HYP, Compose, Format, LetterBox, v8_transforms, xywhn2xyxy
 from ..utils import LOGGER
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -36,18 +37,20 @@ def img2label_path(img_path):
 class YOLODataset(Dataset):
     """Detection dataset returning per-sample dicts ready for ``collate_fn``."""
 
-    def __init__(self, path, imgsz=640, augment=False, hsv=(0.015, 0.7, 0.4), fliplr=0.5, mosaic=1.0):
+    def __init__(self, path, imgsz=640, augment=False, hyp=None, mosaic=None):
         self.imgsz = imgsz
         self.augment = augment
-        self.hsv = hsv
-        self.fliplr = fliplr
-        self.mosaic = mosaic  # probability of applying mosaic (only when augment=True)
+        self.hyp = {**DEFAULT_HYP, **(hyp or {})}
+        if mosaic is not None:  # convenience override
+            self.hyp["mosaic"] = mosaic
         self.im_files = self._gather_images(path)
         if not self.im_files:
             raise FileNotFoundError(f"No images found under {path!r}")
         self.label_files = [img2label_path(f) for f in self.im_files]
+        self.transforms = self.build_transforms()
         LOGGER.info(f"YOLODataset: {len(self.im_files)} images from {path}")
 
+    # ------------------------------------------------------------------ setup
     @staticmethod
     def _gather_images(path):
         path = Path(path)
@@ -65,6 +68,20 @@ class YOLODataset(Dataset):
             files = [str(path)]
         return files
 
+    def build_transforms(self):
+        """Build the augmentation pipeline (training) or a plain letterbox+format (val)."""
+        if self.augment:
+            return v8_transforms(self, self.imgsz, self.hyp)
+        return Compose([LetterBox((self.imgsz, self.imgsz), scaleup=False), Format()])
+
+    def close_mosaic(self):
+        """Disable mosaic / mixup / copy-paste and rebuild the pipeline (for final epochs)."""
+        self.hyp["mosaic"] = 0.0
+        self.hyp["mixup"] = 0.0
+        self.hyp["copy_paste"] = 0.0
+        self.transforms = self.build_transforms()
+
+    # ------------------------------------------------------------------ data
     def __len__(self):
         return len(self.im_files)
 
@@ -99,57 +116,34 @@ class YOLODataset(Dataset):
             labels = np.zeros((0, 5), np.float32)
         return im, labels, (h0, w0)
 
-    def load_mosaic(self, idx):
-        """Build a 4-image mosaic centred on image ``idx``. Returns (BGR s×s img, pixel-xyxy labels)."""
-        indices = [idx] + [random.randint(0, len(self) - 1) for _ in range(3)]
-        imgs, labels_list = [], []
-        for index in indices:
-            im, labels, _ = self.load_image_resized(index)
-            imgs.append(im)
-            labels_list.append(labels)
-        return build_mosaic(imgs, labels_list, self.imgsz)
-
-    def __getitem__(self, idx):
-        use_mosaic = self.augment and self.mosaic and random.random() < self.mosaic
-        if use_mosaic:
-            im, labels_xyxy = self.load_mosaic(idx)  # s×s BGR, cls+xyxy pixel labels
-            h, w = im.shape[:2]
-            labels = np.zeros((labels_xyxy.shape[0], 5), np.float32)
-            if labels_xyxy.shape[0]:
-                labels[:, 0] = labels_xyxy[:, 0]
-                labels[:, 1:] = xyxy2xywhn(labels_xyxy[:, 1:], w, h)
-            ori_shape = (self.imgsz, self.imgsz)
-        else:
-            im, labels_xyxy, ori_shape = self.load_image_resized(idx)
-            im, ratio, pad = letterbox(im, self.imgsz, scaleup=self.augment)
-            h, w = im.shape[:2]
-            labels = np.zeros((labels_xyxy.shape[0], 5), np.float32)
-            if labels_xyxy.shape[0]:
-                xyxy = labels_xyxy[:, 1:].copy()
-                xyxy[:, [0, 2]] = xyxy[:, [0, 2]] * ratio[0] + pad[0]
-                xyxy[:, [1, 3]] = xyxy[:, [1, 3]] * ratio[1] + pad[1]
-                labels[:, 0] = labels_xyxy[:, 0]
-                labels[:, 1:] = xyxy2xywhn(xyxy, w, h)
-
-        if self.augment:
-            augment_hsv(im, *self.hsv)
-            if self.fliplr and np.random.rand() < self.fliplr:
-                im = np.fliplr(im)
-                if labels.shape[0]:
-                    labels[:, 1] = 1 - labels[:, 1]
-
-        img = np.ascontiguousarray(im[:, :, ::-1].transpose(2, 0, 1))  # BGR->RGB, HWC->CHW
-        labels = torch.from_numpy(np.ascontiguousarray(labels))
+    def get_image_and_label(self, idx):
+        """Return a labels dict (img BGR, cls, xyxy bboxes) consumed by the transform pipeline."""
+        im, labels, ori = self.load_image_resized(idx)
         return {
-            "img": torch.from_numpy(img).float() / 255.0,
-            "cls": labels[:, 0:1] if labels.shape[0] else torch.zeros((0, 1)),
-            "bboxes": labels[:, 1:5] if labels.shape[0] else torch.zeros((0, 4)),
+            "img": im,
+            "cls": labels[:, 0:1] if labels.shape[0] else np.zeros((0, 1), np.float32),
+            "bboxes": labels[:, 1:5] if labels.shape[0] else np.zeros((0, 4), np.float32),
+            "ori_shape": ori,
+            "resized_shape": im.shape[:2],
             "im_file": self.im_files[idx],
-            "ori_shape": ori_shape,
         }
 
+    def __getitem__(self, idx):
+        labels = self.get_image_and_label(idx)
+        labels = self.transforms(labels)  # returns img/cls/bboxes as tensors (Format)
+        return {
+            "img": labels["img"],
+            "cls": labels["cls"],
+            "bboxes": labels["bboxes"],
+            "im_file": labels.get("im_file", self.im_files[idx]),
+            "ori_shape": labels.get("ori_shape", (self.imgsz, self.imgsz)),
+        }
+
+    # ------------------------------------------------------------------ batching
     @staticmethod
     def collate_fn(batch):
+        import torch
+
         imgs = torch.stack([b["img"] for b in batch], 0)
         cls = torch.cat([b["cls"] for b in batch], 0)
         bboxes = torch.cat([b["bboxes"] for b in batch], 0)

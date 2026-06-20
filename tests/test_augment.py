@@ -10,7 +10,17 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from yolo.data.augment import build_mosaic, xywhn2xyxy, xyxy2xywhn
+from yolo.data.augment import (
+    DEFAULT_HYP,
+    Format,
+    LetterBox,
+    RandomFlip,
+    RandomPerspective,
+    build_mosaic,
+    v8_transforms,
+    xywhn2xyxy,
+    xyxy2xywhn,
+)
 
 
 def test_xywhn_xyxy_roundtrip():
@@ -73,9 +83,90 @@ def test_dataset_mosaic_labels_normalised(tmp_path="/tmp/_t_mosaic"):
             assert (b[:, 2] > 0).all() and (b[:, 3] > 0).all()  # positive w/h
 
 
+def test_letterbox_transform_scales_boxes():
+    img = np.zeros((100, 200, 3), np.uint8)
+    labels = {"img": img, "cls": np.array([[0.0]]), "bboxes": np.array([[10.0, 20.0, 60.0, 80.0]], np.float32)}
+    out = LetterBox((640, 640), scaleup=True)(labels)
+    assert out["img"].shape == (640, 640, 3)
+    # box must stay inside the padded canvas and keep its aspect after scaling
+    b = out["bboxes"][0]
+    assert 0 <= b[0] < b[2] <= 640 and 0 <= b[1] < b[3] <= 640
+
+
+def test_random_flip_horizontal_mirrors_boxes():
+    img = np.zeros((100, 100, 3), np.uint8)
+    boxes = np.array([[10.0, 20.0, 30.0, 40.0]], np.float32)
+    labels = {"img": img, "cls": np.array([[1.0]]), "bboxes": boxes.copy()}
+    out = RandomFlip(p=1.0, direction="horizontal")(labels)
+    # x1' = W - x2, x2' = W - x1
+    assert np.allclose(out["bboxes"][0], [100 - 30, 20, 100 - 10, 40])
+
+
+def test_random_perspective_identity_keeps_boxes():
+    # All ranges zero -> pure (near-)identity affine; boxes should be preserved.
+    rng = np.random.default_rng(0)
+    img = (rng.random((320, 320, 3)) * 255).astype(np.uint8)
+    boxes = np.array([[40.0, 40.0, 120.0, 160.0], [200.0, 100.0, 260.0, 180.0]], np.float32)
+    labels = {"img": img, "cls": np.array([[0.0], [1.0]]), "bboxes": boxes.copy()}
+    tf = RandomPerspective(degrees=0, translate=0, scale=0, shear=0, perspective=0)
+    out = tf(labels)
+    assert out["img"].shape == (320, 320, 3)
+    assert out["bboxes"].shape[0] == 2
+    assert np.allclose(out["bboxes"], boxes, atol=1.0)
+
+
+def test_v8_transforms_pipeline_outputs_tensors():
+    import cv2
+    import torch
+
+    from yolo.data.dataset import YOLODataset
+
+    root = "/tmp/_t_pipeline"
+    os.makedirs(f"{root}/images/train", exist_ok=True)
+    os.makedirs(f"{root}/labels/train", exist_ok=True)
+    for i in range(6):
+        im = np.full((256, 256, 3), 40, np.uint8)
+        cv2.rectangle(im, (60, 60), (190, 190), (0, 0, 220), -1)
+        cv2.imwrite(f"{root}/images/train/i{i}.jpg", im)
+        open(f"{root}/labels/train/i{i}.txt", "w").write("0 0.488 0.488 0.508 0.508\n")
+
+    hyp = {**DEFAULT_HYP, "mixup": 1.0, "degrees": 15, "shear": 8, "perspective": 0.0005, "flipud": 0.5, "copy_paste": 0.5}
+    ds = YOLODataset(f"{root}/images/train", imgsz=256, augment=True, hyp=hyp)
+    for k in range(6):
+        s = ds[k]
+        assert isinstance(s["img"], torch.Tensor) and s["img"].shape == (3, 256, 256)
+        b = s["bboxes"].numpy()
+        if b.shape[0]:
+            assert b.min() >= 0.0 and b.max() <= 1.0
+            assert (b[:, 2] > 0).all() and (b[:, 3] > 0).all()
+
+
+def test_close_mosaic_disables_mix():
+    import cv2
+
+    from yolo.data.dataset import YOLODataset
+
+    root = "/tmp/_t_close"
+    os.makedirs(f"{root}/images/train", exist_ok=True)
+    os.makedirs(f"{root}/labels/train", exist_ok=True)
+    for i in range(4):
+        cv2.imwrite(f"{root}/images/train/i{i}.jpg", np.full((128, 128, 3), 50, np.uint8))
+        open(f"{root}/labels/train/i{i}.txt", "w").write("0 0.5 0.5 0.3 0.3\n")
+    ds = YOLODataset(f"{root}/images/train", imgsz=128, augment=True)
+    assert ds.hyp["mosaic"] == 1.0
+    ds.close_mosaic()
+    assert ds.hyp["mosaic"] == 0.0 and ds.hyp["mixup"] == 0.0 and ds.hyp["copy_paste"] == 0.0
+    _ = ds[0]  # still produces a valid sample
+
+
 if __name__ == "__main__":
     test_xywhn_xyxy_roundtrip()
     test_build_mosaic_shape_and_bounds()
     test_build_mosaic_preserves_a_full_object()
     test_dataset_mosaic_labels_normalised()
+    test_letterbox_transform_scales_boxes()
+    test_random_flip_horizontal_mirrors_boxes()
+    test_random_perspective_identity_keeps_boxes()
+    test_v8_transforms_pipeline_outputs_tensors()
+    test_close_mosaic_disables_mix()
     print("All augmentation tests passed.")

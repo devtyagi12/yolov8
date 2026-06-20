@@ -91,33 +91,57 @@ python tools/convert_weights.py yolov8n.pt yolov8n_clean.pt
 | Architecture | `Conv`, `Bottleneck`, `C2f`, `SPPF`, `Concat`, `Detect`, `DFL`; n/s/m/l/x via depth/width scaling. Parameter counts match official (3.16M / 11.17M / 25.9M / 43.7M / 68.2M). |
 | Weight loading | Loads official `.pt` with no `ultralytics` dependency via a safe unpickler + state-dict extractor. Verified bit-exact round trip. |
 | Loss | `v8DetectionLoss` = CIoU box loss + Distribution Focal Loss + BCE classification, with the Task-Aligned Assigner. |
-| Data | YOLO-format `YOLODataset`, letterbox + **mosaic (4-image)** + HSV/flip augmentation, collate function, `DataLoader` builder. |
+| Data | YOLO-format `YOLODataset` + the full `v8_transforms` chain (mosaic, copy-paste, random-perspective, mixup, albumentations, HSV, vertical/horizontal flip), collate function, `DataLoader` builder. |
 | Engine | `DetectionPredictor` (preprocess → forward → NMS → `Results`), `DetectionTrainer` (warmup, LR schedule, param-group weight decay), `DetectionValidator` (COCO-style mAP@0.5 / mAP@0.5:0.95). |
 
 ## Augmentation & visualization
 
-Training uses **mosaic** (4 images stitched into one, then centre-cropped), HSV
-jitter, horizontal flip and letterbox. Mosaic is on by default and is
-automatically **closed for the final epochs** (`close_mosaic`, default 10) so the
-model finishes on clean images:
+Training uses the full Ultralytics `v8_transforms` chain, ported to plain
+NumPy/OpenCV as composable transform classes:
 
-```python
-model.train(..., mosaic=1.0, close_mosaic=10)   # both tunable
+```
+Mosaic -> CopyPaste -> RandomPerspective -> MixUp -> Albumentations
+       -> RandomHSV -> RandomFlip(vertical) -> RandomFlip(horizontal) -> Format
 ```
 
-To confirm augmentation keeps labels aligned with the pixels, render a grid that
-draws the *post-augmentation* boxes back onto the images:
+| Transform | Hyper-parameter(s) | Default |
+|-----------|--------------------|---------|
+| `Mosaic` (4-image) | `mosaic` | 1.0 |
+| `CopyPaste` (box-level) | `copy_paste` | 0.0 |
+| `RandomPerspective` (rotate/scale/shear/translate/perspective) | `degrees`, `scale`, `shear`, `translate`, `perspective` | 0.0, 0.5, 0.0, 0.1, 0.0 |
+| `MixUp` | `mixup` | 0.0 |
+| `Albumentations` (blur/CLAHE/gray — only if `albumentations` installed) | — | p≈0.01 each |
+| `RandomHSV` | `hsv_h`, `hsv_s`, `hsv_v` | 0.015, 0.7, 0.4 |
+| `RandomFlip` vertical / horizontal | `flipud`, `fliplr` | 0.0, 0.5 |
+
+Defaults match Ultralytics exactly (see `yolo.data.augment.DEFAULT_HYP`). Mosaic /
+mixup / copy-paste are automatically **closed for the final epochs**
+(`close_mosaic`, default 10) so the model finishes on clean images. Override any
+hyper-parameter via the `hyp` dict:
+
+```python
+model.train(
+    data_train="datasets/mydata/images/train",
+    hyp={"degrees": 10.0, "mixup": 0.1, "scale": 0.7, "flipud": 0.1},
+    close_mosaic=10,
+)
+```
+
+To confirm the augmentation keeps labels aligned with the pixels, render a grid
+that draws the *post-augmentation* boxes back onto the images:
 
 ```bash
-# mosaic samples (default)
-python tools/visualize_augment.py --data datasets/mydata/images/train --n 9 --out mosaic.png
-# letterbox-only augmentation
+# default v8 pipeline
+python tools/visualize_augment.py --data datasets/mydata/images/train --n 9 --out aug.png
+# exercise every transform at once
+python tools/visualize_augment.py --data datasets/mydata/images/train \
+    --degrees 20 --shear 10 --perspective 0.0006 --mixup 1.0 --flipud 0.5 --copy-paste 0.5 --out aug_full.png
+# mosaic off / all augmentation off
 python tools/visualize_augment.py --data datasets/mydata/images/train --no-mosaic --out plain.png
-# raw images, no augmentation
 python tools/visualize_augment.py --data datasets/mydata/images/train --no-augment --out raw.png
 ```
 
-If the drawn boxes sit on the objects, mosaic + label bookkeeping are correct.
+If the drawn boxes sit on the objects, the transforms + label bookkeeping are correct.
 
 ## Layout
 
@@ -147,8 +171,11 @@ round trip, the predict API, and loss convergence on an overfit batch.
 
 - Detection only (no seg/pose/cls/obb).
 - BatchNorm needs a real batch size; like the original, don't train at `batch=1`.
-- Mosaic, HSV, horizontal flip and letterbox are implemented; mixup / copy-paste /
-  random-perspective are not.
+- The full `v8_transforms` augmentation chain is implemented (mosaic, copy-paste,
+  random-perspective, mixup, albumentations, HSV, flips). CopyPaste is a box-level
+  analog of the official segment-mask version, and Albumentations is a no-op unless
+  the optional `albumentations` package is installed — both matching Ultralytics'
+  detection defaults (`copy_paste=0`).
 - Not affiliated with or endorsed by Ultralytics. YOLOv8 weights you load remain
   subject to their original (AGPL-3.0) license.
 ```
