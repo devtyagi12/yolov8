@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# weights & data & runs
+*.pt
+*.pth
+*.onnx
+runs/
+datasets/
+*.jpg
+*.jpeg
+*.png
+!assets/*.png
+!assets/*.jpg
+
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
