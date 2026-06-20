@@ -10,6 +10,7 @@ The label path is derived from the image path by swapping ``/images/`` for
 convention), so existing YOLO datasets work unchanged.
 """
 
+import random
 from pathlib import Path
 
 import cv2
@@ -17,7 +18,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ..data.augment import augment_hsv, letterbox
+from ..data.augment import augment_hsv, build_mosaic, letterbox, xywhn2xyxy, xyxy2xywhn
 from ..utils import LOGGER
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -35,11 +36,12 @@ def img2label_path(img_path):
 class YOLODataset(Dataset):
     """Detection dataset returning per-sample dicts ready for ``collate_fn``."""
 
-    def __init__(self, path, imgsz=640, augment=False, hsv=(0.015, 0.7, 0.4), fliplr=0.5):
+    def __init__(self, path, imgsz=640, augment=False, hsv=(0.015, 0.7, 0.4), fliplr=0.5, mosaic=1.0):
         self.imgsz = imgsz
         self.augment = augment
         self.hsv = hsv
         self.fliplr = fliplr
+        self.mosaic = mosaic  # probability of applying mosaic (only when augment=True)
         self.im_files = self._gather_images(path)
         if not self.im_files:
             raise FileNotFoundError(f"No images found under {path!r}")
@@ -77,44 +79,73 @@ class YOLODataset(Dataset):
             lb = np.zeros((0, 5), dtype=np.float32)
         return lb  # (n, 5): cls, cx, cy, w, h (normalised)
 
-    def __getitem__(self, idx):
+    def load_image_resized(self, idx):
+        """Load a BGR image resized so its long side equals ``imgsz`` plus pixel-xyxy labels."""
         im = cv2.imread(self.im_files[idx])
         if im is None:
             raise FileNotFoundError(f"Image not found: {self.im_files[idx]}")
         h0, w0 = im.shape[:2]
-        labels = self.load_labels(idx).copy()
+        r = self.imgsz / max(h0, w0)
+        if r != 1:
+            interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+            im = cv2.resize(im, (round(w0 * r), round(h0 * r)), interpolation=interp)
+        h, w = im.shape[:2]
+
+        labels = self.load_labels(idx)
+        if labels.shape[0]:
+            xyxy = xywhn2xyxy(labels[:, 1:], w, h)
+            labels = np.concatenate([labels[:, 0:1], xyxy], 1)
+        else:
+            labels = np.zeros((0, 5), np.float32)
+        return im, labels, (h0, w0)
+
+    def load_mosaic(self, idx):
+        """Build a 4-image mosaic centred on image ``idx``. Returns (BGR s×s img, pixel-xyxy labels)."""
+        indices = [idx] + [random.randint(0, len(self) - 1) for _ in range(3)]
+        imgs, labels_list = [], []
+        for index in indices:
+            im, labels, _ = self.load_image_resized(index)
+            imgs.append(im)
+            labels_list.append(labels)
+        return build_mosaic(imgs, labels_list, self.imgsz)
+
+    def __getitem__(self, idx):
+        use_mosaic = self.augment and self.mosaic and random.random() < self.mosaic
+        if use_mosaic:
+            im, labels_xyxy = self.load_mosaic(idx)  # s×s BGR, cls+xyxy pixel labels
+            h, w = im.shape[:2]
+            labels = np.zeros((labels_xyxy.shape[0], 5), np.float32)
+            if labels_xyxy.shape[0]:
+                labels[:, 0] = labels_xyxy[:, 0]
+                labels[:, 1:] = xyxy2xywhn(labels_xyxy[:, 1:], w, h)
+            ori_shape = (self.imgsz, self.imgsz)
+        else:
+            im, labels_xyxy, ori_shape = self.load_image_resized(idx)
+            im, ratio, pad = letterbox(im, self.imgsz, scaleup=self.augment)
+            h, w = im.shape[:2]
+            labels = np.zeros((labels_xyxy.shape[0], 5), np.float32)
+            if labels_xyxy.shape[0]:
+                xyxy = labels_xyxy[:, 1:].copy()
+                xyxy[:, [0, 2]] = xyxy[:, [0, 2]] * ratio[0] + pad[0]
+                xyxy[:, [1, 3]] = xyxy[:, [1, 3]] * ratio[1] + pad[1]
+                labels[:, 0] = labels_xyxy[:, 0]
+                labels[:, 1:] = xyxy2xywhn(xyxy, w, h)
 
         if self.augment:
             augment_hsv(im, *self.hsv)
-        im, ratio, pad = letterbox(im, self.imgsz, scaleup=self.augment)
-        h, w = im.shape[:2]
-
-        # Map normalised xywh (relative to original) into the letterboxed image, keep normalised.
-        if labels.shape[0]:
-            boxes = labels[:, 1:].copy()
-            boxes[:, 0] = ratio[0] * w0 * (labels[:, 1] - labels[:, 3] / 2) + pad[0]  # x1
-            boxes[:, 1] = ratio[1] * h0 * (labels[:, 2] - labels[:, 4] / 2) + pad[1]  # y1
-            boxes[:, 2] = ratio[0] * w0 * (labels[:, 1] + labels[:, 3] / 2) + pad[0]  # x2
-            boxes[:, 3] = ratio[1] * h0 * (labels[:, 2] + labels[:, 4] / 2) + pad[1]  # y2
-            labels = labels.copy()
-            labels[:, 1] = ((boxes[:, 0] + boxes[:, 2]) / 2) / w
-            labels[:, 2] = ((boxes[:, 1] + boxes[:, 3]) / 2) / h
-            labels[:, 3] = (boxes[:, 2] - boxes[:, 0]) / w
-            labels[:, 4] = (boxes[:, 3] - boxes[:, 1]) / h
-
-        if self.augment and self.fliplr and np.random.rand() < self.fliplr:
-            im = np.fliplr(im)
-            if labels.shape[0]:
-                labels[:, 1] = 1 - labels[:, 1]
+            if self.fliplr and np.random.rand() < self.fliplr:
+                im = np.fliplr(im)
+                if labels.shape[0]:
+                    labels[:, 1] = 1 - labels[:, 1]
 
         img = np.ascontiguousarray(im[:, :, ::-1].transpose(2, 0, 1))  # BGR->RGB, HWC->CHW
-        labels = torch.from_numpy(labels)
+        labels = torch.from_numpy(np.ascontiguousarray(labels))
         return {
             "img": torch.from_numpy(img).float() / 255.0,
             "cls": labels[:, 0:1] if labels.shape[0] else torch.zeros((0, 1)),
             "bboxes": labels[:, 1:5] if labels.shape[0] else torch.zeros((0, 4)),
             "im_file": self.im_files[idx],
-            "ori_shape": (h0, w0),
+            "ori_shape": ori_shape,
         }
 
     @staticmethod

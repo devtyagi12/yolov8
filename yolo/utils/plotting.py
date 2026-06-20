@@ -72,6 +72,40 @@ class Annotator:
         return self.im
 
 
+def draw_normalized(im_bgr, cls, boxes_xywhn, names=None):
+    """Draw normalised ``[cx, cy, w, h]`` boxes (in [0, 1]) on a copy of a BGR image.
+
+    Useful for verifying that augmentation keeps labels aligned with the pixels.
+    """
+    names = names or {}
+    h, w = im_bgr.shape[:2]
+    annotator = Annotator(np.ascontiguousarray(im_bgr))
+    cls = np.asarray(cls).reshape(-1)
+    boxes_xywhn = np.asarray(boxes_xywhn, dtype=np.float32).reshape(-1, 4)
+    for c, (cx, cy, bw, bh) in zip(cls, boxes_xywhn):
+        x1, y1 = (cx - bw / 2) * w, (cy - bh / 2) * h
+        x2, y2 = (cx + bw / 2) * w, (cy + bh / 2) * h
+        ci = int(c)
+        annotator.box_label([x1, y1, x2, y2], names.get(ci, str(ci)), color=color_for(ci))
+    return annotator.result()
+
+
+def image_grid(images, cols=2, pad=6, fill=30):
+    """Tile equal-sized BGR images into a single grid image (row-major)."""
+    if not images:
+        raise ValueError("image_grid received no images")
+    h, w = images[0].shape[:2]
+    cols = max(1, min(cols, len(images)))
+    rows = (len(images) + cols - 1) // cols
+    grid = np.full((rows * h + (rows + 1) * pad, cols * w + (cols + 1) * pad, 3), fill, np.uint8)
+    for i, im in enumerate(images):
+        r, c = divmod(i, cols)
+        y = pad + r * (h + pad)
+        x = pad + c * (w + pad)
+        grid[y : y + h, x : x + w] = cv2.resize(im, (w, h)) if im.shape[:2] != (h, w) else im
+    return grid
+
+
 def plot_detections(im, boxes, names=None):
     """Render an annotated copy of ``im`` from a ``(n, 6)`` detection tensor/array.
 

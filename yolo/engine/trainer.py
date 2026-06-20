@@ -60,6 +60,8 @@ class DetectionTrainer:
         workers=4,
         project="runs/train",
         save=True,
+        mosaic=1.0,
+        close_mosaic=10,
     ):
         self.model = model.to(device)
         self.device = device
@@ -70,8 +72,11 @@ class DetectionTrainer:
         self.warmup_epochs = warmup_epochs
         self.save = save
         self.project = Path(project)
+        self.close_mosaic = close_mosaic  # disable mosaic for the final N epochs
 
-        self.train_loader = build_dataloader(data_train, imgsz=imgsz, batch=batch, augment=True, workers=workers)
+        self.train_loader = build_dataloader(
+            data_train, imgsz=imgsz, batch=batch, augment=True, workers=workers, mosaic=mosaic
+        )
         self.val_loader = (
             build_dataloader(data_val, imgsz=imgsz, batch=batch, augment=False, workers=workers, shuffle=False)
             if data_val
@@ -99,6 +104,10 @@ class DetectionTrainer:
         self.model.train()
         for epoch in range(self.epochs):
             self.model.train()
+            # Turn off mosaic for the final epochs so the model finishes on clean images.
+            if self.close_mosaic and epoch == self.epochs - self.close_mosaic:
+                LOGGER.info(f"Closing mosaic augmentation for the last {self.close_mosaic} epochs")
+                self.train_loader.dataset.mosaic = 0.0
             mloss = torch.zeros(3, device=self.device)
             for i, batch in enumerate(self.train_loader):
                 ni = i + self.nb * epoch
