@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
-from ..utils import LOGGER
+from ..utils import LOGGER, read_label_text
 from ..utils.poly_ops import (
     DEFAULT_ANGLE_STEP,
     DEFAULT_MAX_DISTANCE,
@@ -184,7 +184,7 @@ class PolygonDataset(Dataset):
             files = [str(p) for p in sorted(path.rglob("*")) if p.suffix.lower() in IMG_EXTS]
         elif path.is_file() and path.suffix == ".txt":
             base = path.parent
-            for line in path.read_text().splitlines():
+            for line in (read_label_text(path) or "").splitlines():
                 line = line.strip()
                 if line:
                     p = (base / line) if not Path(line).is_absolute() else Path(line)
@@ -212,23 +212,32 @@ class PolygonDataset(Dataset):
         """Return ``(list[poly_norm (k,2)], cls (n,), distance (n,))`` for image ``idx``."""
         lf = self.label_files[idx]
         polys, classes, dists = [], [], []
-        if Path(lf).is_file():
-            for line in Path(lf).read_text().strip().splitlines():
+        text = read_label_text(lf) if Path(lf).is_file() else None  # None if binary/corrupt
+        if text is not None:
+            bad = 0
+            for line in text.strip().splitlines():
                 toks = line.split()
                 if not toks:
                     continue
-                cls_id = float(toks[0])
-                coords = toks[1:]
-                dist = None
-                if self.has_distance:
-                    dist = float(coords[-1])
-                    coords = coords[:-1]
-                if len(coords) < 6 or len(coords) % 2 != 0:  # need >= 3 vertices
+                try:
+                    cls_id = float(toks[0])
+                    coords = toks[1:]
+                    dist = None
+                    if self.has_distance:
+                        dist = float(coords[-1])
+                        coords = coords[:-1]
+                    if len(coords) < 6 or len(coords) % 2 != 0:  # need >= 3 vertices
+                        bad += 1
+                        continue
+                    poly = np.array([float(c) for c in coords], np.float32).reshape(-1, 2)
+                except (ValueError, IndexError):
+                    bad += 1
                     continue
-                poly = np.array(coords, np.float32).reshape(-1, 2)
                 polys.append(poly)
                 classes.append(cls_id)
                 dists.append(encode_distance(dist, self.min_distance, self.max_distance) if self.has_distance else NO_DISTANCE)
+            if bad:
+                LOGGER.warning(f"Skipped {bad} malformed line(s) in {lf}")
         cls = np.array(classes, np.float32) if classes else np.zeros((0,), np.float32)
         distance = np.array(dists, np.float32) if dists else np.zeros((0,), np.float32)
         return polys, cls, distance

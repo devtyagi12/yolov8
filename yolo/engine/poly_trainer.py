@@ -44,6 +44,7 @@ class PolygonTrainer:
         project="runs/polygon",
         save=True,
         plots=True,
+        tensorboard=False,
     ):
         self.model = model.to(device)
         self.device = device
@@ -72,6 +73,55 @@ class PolygonTrainer:
         self.lf = lambda x: (1 - x / self.epochs) * (1.0 - lrf) + lrf
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)
         self.warmup_iters = max(round(self.warmup_epochs * self.nb), 100)
+
+        # Logging: results.csv + optional TensorBoard + end-of-run results.png.
+        self.csv_path = self.project / "results.csv"
+        self.tb = None
+        if tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+
+                self.project.mkdir(parents=True, exist_ok=True)
+                self.tb = SummaryWriter(str(self.project))
+                LOGGER.info(f"TensorBoard: logging to {self.project}")
+            except ImportError:
+                LOGGER.info("tensorboard not installed; skipping TensorBoard logging")
+
+    def _init_plots(self):
+        """Fresh results.csv and a class-distribution histogram (labels.png)."""
+        if self.csv_path.exists():
+            self.csv_path.unlink()
+        if not self.plots:
+            return
+        self.project.mkdir(parents=True, exist_ok=True)
+        from ..utils.plotting import plot_label_histogram
+
+        all_cls = []
+        for ds in getattr(self.train_concat, "datasets_list", []):
+            for i in range(len(ds)):
+                _, cls, _ = ds.parse_label_file(i)
+                all_cls.extend(cls.tolist())
+        plot_label_histogram(all_cls, self.model.names, str(self.project / "labels.png"))
+
+    def _log_epoch(self, epoch, mloss, lr, metrics):
+        row = {
+            "epoch": epoch + 1,
+            "train/box": float(mloss[0]), "train/cls": float(mloss[1]), "train/dfl": float(mloss[2]),
+            "train/poly": float(mloss[3]), "train/dist": float(mloss[4]), "lr": float(lr),
+            "metrics/precision": float(metrics.get("precision", 0.0)),
+            "metrics/recall": float(metrics.get("recall", 0.0)),
+            "metrics/f1": float(metrics.get("f1", 0.0)),
+        }
+        self.project.mkdir(parents=True, exist_ok=True)
+        write_header = not self.csv_path.exists()
+        with open(self.csv_path, "a") as f:
+            if write_header:
+                f.write(",".join(row.keys()) + "\n")
+            f.write(",".join(f"{v:g}" for v in row.values()) + "\n")
+        if self.tb is not None:
+            for k, v in row.items():
+                if k != "epoch":
+                    self.tb.add_scalar(k, v, epoch + 1)
 
     def _warmup(self, ni, epoch):
         if ni > self.warmup_iters:
@@ -102,6 +152,7 @@ class PolygonTrainer:
 
     def train(self):
         LOGGER.info(f"Starting polygon training for {self.epochs} epochs on {self.device}...")
+        self._init_plots()
         for epoch in range(self.epochs):
             self.model.train()
             if self.close_mosaic and epoch == self.epochs - self.close_mosaic:
@@ -128,9 +179,18 @@ class PolygonTrainer:
                 f"Epoch {epoch + 1}/{self.epochs}  box={mloss[0]:.3f} cls={mloss[1]:.3f} dfl={mloss[2]:.3f} "
                 f"poly={mloss[3]:.4f} dist={mloss[4]:.4f}  lr={self.optimizer.param_groups[0]['lr']:.5f}"
             )
+            metrics = {}
             if self.val_loader is not None:
-                self.validate(epoch)
+                metrics = self.validate(epoch)
+            self._log_epoch(epoch, mloss, self.optimizer.param_groups[0]["lr"], metrics)
 
+        if self.plots and self.csv_path.exists():
+            from ..utils.plotting import plot_results
+
+            plot_results(str(self.csv_path))
+            LOGGER.info(f"Saved training plots to {self.project}")
+        if self.tb is not None:
+            self.tb.close()
         if self.save:
             self._save()
         return self.model

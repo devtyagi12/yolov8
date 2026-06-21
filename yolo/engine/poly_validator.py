@@ -35,7 +35,7 @@ class PolygonValidator:
             preds = non_max_suppression(y[:, : 4 + self.nc], self.conf, 0.45, max_det=self.max_det, nc=self.nc)
 
             if bi == 0 and self.plot_samples and self.sample_prefix:
-                self._plot_samples(batch, imgs, preds)
+                self._plot_samples(batch, imgs, y)
 
             for si, pred in enumerate(preds):
                 idx = batch["batch_idx"] == si
@@ -73,14 +73,20 @@ class PolygonValidator:
         LOGGER.info(f"   bbox P={precision:.3f}  R={recall:.3f}  F1={f1:.3f}  (TP={tp} FP={fp} FN={fn})")
         return {"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
 
-    def _plot_samples(self, batch, imgs, preds):
-        """Save GT (bbox + star polygon) and prediction (bbox) grids for the first val batch."""
+    def _plot_samples(self, batch, imgs, y):
+        """Save GT (bbox + star polygon) and prediction (bbox + label + polygon) grids.
+
+        ``y`` is the full raw model output ``(B, C, A)`` so predicted polygons and
+        distances can be decoded (parity with the ground-truth side and ``predict()``).
+        """
         import cv2
         import numpy as np
         from pathlib import Path
 
-        from ..utils.plotting import draw_poly_star, image_grid, plot_detections
+        from ..utils.plotting import draw_poly_predictions, draw_poly_star, image_grid
+        from .poly_predictor import decode_poly_output
 
+        imgsz = imgs.shape[-1]
         n = min(9, imgs.shape[0])
         gt_tiles, pred_tiles = [], []
         for si in range(n):
@@ -90,9 +96,14 @@ class PolygonValidator:
             gt_tiles.append(draw_poly_star(arr.copy(), batch["cls"][idx].numpy().reshape(-1),
                                            batch["bboxes"][idx].numpy(), batch["poly"][idx].numpy(),
                                            self.num_angles, self.names))
-            det = preds[si]
-            pb = det.cpu().numpy() if det is not None and len(det) else None
-            pred_tiles.append(plot_detections(arr.copy(), pb, names=self.names))
+            boxes6, dists, polys = decode_poly_output(
+                y[si], self.nc, self.num_angles, conf_thr=self.conf, iou_thr=0.45,
+                max_det=self.max_det, imgsz=imgsz,
+            )
+            b = boxes6.cpu().numpy() if boxes6 is not None else None
+            d = dists.cpu().numpy() if dists is not None else None
+            p = polys.cpu().numpy() if polys is not None else None
+            pred_tiles.append(draw_poly_predictions(arr.copy(), b, d, p, names=self.names))
         Path(self.sample_prefix).parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(f"{self.sample_prefix}_labels.jpg", image_grid(gt_tiles, cols=3))
         cv2.imwrite(f"{self.sample_prefix}_pred.jpg", image_grid(pred_tiles, cols=3))

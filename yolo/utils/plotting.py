@@ -113,6 +113,29 @@ def draw_poly_star(im_bgr, cls, bboxes_xywhn, poly_star, num_angles, names=None,
     return annotator.result()
 
 
+def draw_poly_predictions(im_bgr, boxes6, dists, polys, names=None, conf_thr=0.5):
+    """Draw predicted box + ``"cls conf d=dist"`` label + polygon outline (pixel coords).
+
+    ``boxes6`` (n,6) ``[x1,y1,x2,y2,conf,cls]``, ``dists`` (n,), ``polys`` (n,N,3) ``[x,y,conf]``.
+    """
+    names = names or {}
+    annotator = Annotator(np.ascontiguousarray(im_bgr))
+    if boxes6 is None or len(boxes6) == 0:
+        return annotator.result()
+    boxes6 = np.asarray(boxes6, dtype=np.float32)
+    dists = np.asarray(dists, dtype=np.float32).reshape(-1)
+    polys = np.asarray(polys, dtype=np.float32)
+    for i, (*xyxy, conf, cls) in enumerate(boxes6):
+        c = int(cls)
+        col = color_for(c)
+        label = f"{names.get(c, str(c))} {conf:.2f} d={dists[i]:.1f}"
+        annotator.box_label(xyxy, label, color=col)
+        pts = polys[i][polys[i][:, 2] >= conf_thr][:, :2]
+        if len(pts) >= 3:
+            cv2.polylines(annotator.im, [pts.astype(np.int32)], True, col, 2, cv2.LINE_AA)
+    return annotator.result()
+
+
 def image_grid(images, cols=2, pad=6, fill=30):
     """Tile equal-sized BGR images into a single grid image (row-major)."""
     if not images:

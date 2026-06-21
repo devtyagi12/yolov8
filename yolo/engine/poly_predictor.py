@@ -27,6 +27,48 @@ from ..utils.poly_ops import (
 )
 
 
+def decode_poly_output(pred, nc, num_angles, conf_thr=0.25, iou_thr=0.45, max_det=300,
+                       imgsz=640, min_distance=DEFAULT_MIN_DISTANCE, max_distance=DEFAULT_MAX_DISTANCE):
+    """Decode one image's raw model output ``(C, A)`` into detections in input-pixel space.
+
+    Returns ``(boxes6, dists, polys)`` or ``(None, None, None)`` if no detection passes
+    ``conf_thr``. ``boxes6`` is ``(n, 6)`` ``[x1,y1,x2,y2,conf,cls]`` (letterbox pixels),
+    ``dists`` is ``(n,)`` decoded distance, ``polys`` is ``(n, num_angles, 3)`` of
+    ``[x, y, conf]`` with vertices in letterbox pixels (origin = predicted box centre).
+    """
+    N = num_angles
+    pred = pred.transpose(0, 1)  # (A, C)
+    box, cls = pred[:, :4], pred[:, 4 : 4 + nc]
+    off = 4 + nc
+    dist_raw = pred[:, off]
+    pconf = pred[:, off + 1 : off + 1 + N]
+    pangle = pred[:, off + 1 + N : off + 1 + 2 * N]
+    pdist = pred[:, off + 1 + 2 * N : off + 1 + 3 * N]
+
+    conf, j = cls.max(1)
+    keep = conf > conf_thr
+    if int(keep.sum()) == 0:
+        return None, None, None
+    box, conf, j = box[keep], conf[keep], j[keep]
+    dist_raw, pconf, pangle, pdist = dist_raw[keep], pconf[keep], pangle[keep], pdist[keep]
+
+    xyxy = xywh2xyxy(box)
+    i = torchvision.ops.nms(xyxy, conf, iou_thr)[:max_det]
+    xyxy, conf, j = xyxy[i], conf[i], j[i]
+    dist_raw, pconf, pangle, pdist = dist_raw[i], pconf[i], pangle[i], pdist[i]
+
+    # Polygon origin = centre of the predicted box, normalised to letterbox space.
+    cx = (xyxy[:, 0] + xyxy[:, 2]) / 2 / imgsz
+    cy = (xyxy[:, 1] + xyxy[:, 3]) / 2 / imgsz
+    origin = torch.stack((cx, cy), 1)
+    poly = decode_polygons(pconf, pangle, pdist, origin, num_angles=N)  # normalised xy + conf
+    poly[..., :2] *= imgsz  # to letterbox pixels
+
+    boxes6 = torch.cat((xyxy, conf[:, None], j[:, None].float()), 1)
+    dists = decode_distance(dist_raw, min_distance, max_distance)
+    return boxes6, dists, poly
+
+
 class PolyResults:
     """Detections of a single image, each carrying a polygon and a distance."""
 
@@ -87,18 +129,6 @@ class PolyResults:
         return f"PolyResults(path={self.path!r}, {len(self)} detections)"
 
 
-def _scale_points(points, imgsz, ratio, pad, orig_shape):
-    """Map normalised [0,1] (letterbox-space) points to original-image pixels."""
-    pts = points.clone()
-    pts[..., 0] = pts[..., 0] * imgsz  # to letterbox pixels
-    pts[..., 1] = pts[..., 1] * imgsz
-    pts[..., 0] = (pts[..., 0] - pad[0]) / ratio[0]
-    pts[..., 1] = (pts[..., 1] - pad[1]) / ratio[1]
-    pts[..., 0].clamp_(0, orig_shape[1])
-    pts[..., 1].clamp_(0, orig_shape[0])
-    return pts
-
-
 class PolygonPredictor:
     """Run polygon + distance inference for a built polygon model."""
 
@@ -137,39 +167,17 @@ class PolygonPredictor:
         return results
 
     def _postprocess(self, pred, orig_shape, ratio, pad):
-        """Decode a single image's raw output into boxes, distances, polygons."""
-        nc, N = self.nc, self.num_angles
-        pred = pred.transpose(0, 1)  # (A, C)
-        box = pred[:, :4]
-        cls = pred[:, 4 : 4 + nc]
-        off = 4 + nc
-        dist_raw = pred[:, off]
-        pconf = pred[:, off + 1 : off + 1 + N]
-        pangle = pred[:, off + 1 + N : off + 1 + 2 * N]
-        pdist = pred[:, off + 1 + 2 * N : off + 1 + 3 * N]
-
-        conf, j = cls.max(1)
-        keep = conf > self.conf
-        if keep.sum() == 0:
+        """Decode a single image's raw output and scale boxes + polygons to the original image."""
+        boxes6, distance, poly = decode_poly_output(
+            pred, self.nc, self.num_angles, conf_thr=self.conf, iou_thr=self.iou, max_det=self.max_det,
+            imgsz=self.imgsz, min_distance=self.min_distance, max_distance=self.max_distance,
+        )
+        if boxes6 is None:
             return None, None, None
-        box, conf, j = box[keep], conf[keep], j[keep]
-        dist_raw, pconf, pangle, pdist = dist_raw[keep], pconf[keep], pangle[keep], pdist[keep]
-
-        xyxy = xywh2xyxy(box)
-        i = torchvision.ops.nms(xyxy, conf, self.iou)[: self.max_det]
-        xyxy, conf, j = xyxy[i], conf[i], j[i]
-        dist_raw, pconf, pangle, pdist = dist_raw[i], pconf[i], pangle[i], pdist[i]
-
-        # Polygon origin = centre of the predicted box, normalised to letterbox space.
-        cx = (xyxy[:, 0] + xyxy[:, 2]) / 2 / self.imgsz
-        cy = (xyxy[:, 1] + xyxy[:, 3]) / 2 / self.imgsz
-        origin = torch.stack((cx, cy), 1)  # (n, 2) normalised
-        poly = decode_polygons(pconf, pangle, pdist, origin, num_angles=N)  # (n, N, 3) normalised xy + conf
-        poly[..., :2] = _scale_points(poly[..., :2], self.imgsz, ratio, pad, orig_shape)
-
-        boxes6 = torch.cat((xyxy, conf[:, None], j[:, None].float()), 1)
+        # Scale from letterbox pixels back to the original image.
         boxes6[:, :4] = clip_boxes(self._scale_boxes(boxes6[:, :4], ratio, pad), orig_shape)
-        distance = decode_distance(dist_raw, self.min_distance, self.max_distance)
+        poly[..., 0] = ((poly[..., 0] - pad[0]) / ratio[0]).clamp(0, orig_shape[1])
+        poly[..., 1] = ((poly[..., 1] - pad[1]) / ratio[1]).clamp(0, orig_shape[0])
         return boxes6, distance, poly
 
     @staticmethod

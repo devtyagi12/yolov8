@@ -94,10 +94,31 @@ def test_loss_decreases_on_overfit():
     assert last < first * 0.5, f"loss did not drop: {first:.3f} -> {last:.3f}"
 
 
+def test_corrupt_label_file_is_skipped():
+    """A binary/NUL detection label is skipped (no crash); a bad line is dropped, valid kept."""
+    import cv2
+
+    from yolo.data.dataset import YOLODataset
+
+    root = "/tmp/_t_det_corrupt"
+    os.makedirs(f"{root}/images/train", exist_ok=True)
+    os.makedirs(f"{root}/labels/train", exist_ok=True)
+    for i in range(3):
+        cv2.imwrite(f"{root}/images/train/i{i}.jpg", np.full((64, 64, 3), 50, np.uint8))
+    open(f"{root}/labels/train/i0.txt", "w").write("0 0.5 0.5 0.3 0.3\n")            # valid
+    open(f"{root}/labels/train/i1.txt", "wb").write(b"\x00\x00\x00\x00")              # corrupt
+    open(f"{root}/labels/train/i2.txt", "w").write("0 0.5 0.5 0.3 0.3\nBAD a b\n")    # 1 bad line
+    ds = YOLODataset(f"{root}/images/train", imgsz=64)
+    assert ds.load_labels(0).shape[0] == 1   # valid
+    assert ds.load_labels(1).shape[0] == 0   # corrupt -> skipped, no crash
+    assert ds.load_labels(2).shape[0] == 1   # bad line dropped, valid kept
+
+
 if __name__ == "__main__":
     test_param_counts_match_official()
     test_forward_output_shape()
     test_checkpoint_roundtrip()
     test_predict_api_runs()
     test_loss_decreases_on_overfit()
+    test_corrupt_label_file_is_skipped()
     print("All smoke tests passed.")

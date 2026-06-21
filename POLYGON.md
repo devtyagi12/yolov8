@@ -98,6 +98,18 @@ the predicted polygon origin (used at inference) is the **predicted** box centre
 
 Validation metric: **bounding-box F1** (`PolygonValidator`).
 
+## Training artifacts
+
+Polygon training writes the same visuals as the standard detector (to the run dir):
+`results.csv` + `results.png` (box/cls/dfl/**poly**/**dist** losses + precision/recall/F1
+curves), `labels.png` (class histogram), per-epoch `train_batches/train_epoch{N}.jpg`,
+and per-validation `val_batches/val_epoch{N}_{labels,pred}.jpg`. The `*_pred.jpg` images
+show the **full** prediction — box + class + confidence + `d=distance` + polygon outline
+(parity with `predict()`). Pass `tensorboard=True` for TensorBoard scalar logging.
+
+Corrupt / binary label files are skipped with a warning (and malformed lines dropped)
+rather than aborting the run.
+
 ## Quick start
 
 ```python

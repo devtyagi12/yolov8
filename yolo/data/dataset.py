@@ -20,7 +20,7 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from ..data.augment import DEFAULT_HYP, Compose, Format, LetterBox, v8_transforms, xywhn2xyxy
-from ..utils import LOGGER
+from ..utils import LOGGER, read_label_text
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
@@ -63,7 +63,8 @@ class YOLODataset(Dataset):
             files = [str(p) for p in sorted(path.rglob("*")) if p.suffix.lower() in IMG_EXTS]
         elif path.is_file() and path.suffix == ".txt":  # list file
             base = path.parent
-            for line in path.read_text().splitlines():
+            text = read_label_text(path)
+            for line in (text or "").splitlines():
                 line = line.strip()
                 if line:
                     p = (base / line) if not Path(line).is_absolute() else Path(line)
@@ -91,14 +92,27 @@ class YOLODataset(Dataset):
 
     def load_labels(self, idx):
         lf = self.label_files[idx]
-        if Path(lf).is_file():
-            with open(lf) as f:
-                lb = np.array([x.split() for x in f.read().strip().splitlines() if x], dtype=np.float32)
-            if lb.size == 0:
-                lb = np.zeros((0, 5), dtype=np.float32)
-        else:
-            lb = np.zeros((0, 5), dtype=np.float32)
-        return lb  # (n, 5): cls, cx, cy, w, h (normalised)
+        empty = np.zeros((0, 5), dtype=np.float32)
+        if not Path(lf).is_file():
+            return empty
+        text = read_label_text(lf)  # None if the file is binary/corrupt (warned)
+        if text is None:
+            return empty
+        rows, bad = [], 0
+        for line in text.strip().splitlines():
+            toks = line.split()
+            if not toks:
+                continue
+            if len(toks) != 5:  # detection label: cls cx cy w h
+                bad += 1
+                continue
+            try:
+                rows.append([float(t) for t in toks])
+            except ValueError:
+                bad += 1
+        if bad:
+            LOGGER.warning(f"Skipped {bad} malformed line(s) in {lf}")
+        return np.array(rows, dtype=np.float32) if rows else empty  # (n, 5)
 
     def _read_resized(self, idx):
         """Read + resize an image (long side = imgsz). Returns (im, (h0, w0))."""
