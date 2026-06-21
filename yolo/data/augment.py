@@ -19,6 +19,8 @@ import cv2
 import numpy as np
 import torch
 
+from ..utils.poly_ops import NO_DISTANCE
+
 # --------------------------------------------------------------------------- #
 # Default detection hyper-parameters (identical to Ultralytics' defaults).
 # --------------------------------------------------------------------------- #
@@ -127,7 +129,7 @@ def build_mosaic(imgs, labels_list, imgsz, center_range=(0.5, 1.5), fill=114, mi
     Returns ``(s×s image, (m, 5) cls+xyxy labels)``. The training pipeline instead uses the
     :class:`Mosaic` transform (uncropped) followed by :class:`RandomPerspective`.
     """
-    img4, labels4, _ = _mosaic4_canvas(imgs, labels_list, imgsz, center_range, fill)
+    img4, labels4, _, _ = _mosaic4_canvas(imgs, labels_list, imgsz, center_range, fill)
     off = imgsz // 2
     img_c = np.ascontiguousarray(img4[off : off + imgsz, off : off + imgsz])
     if labels4.shape[0]:
@@ -140,14 +142,20 @@ def build_mosaic(imgs, labels_list, imgsz, center_range=(0.5, 1.5), fill=114, mi
     return img_c, labels4
 
 
-def _mosaic4_canvas(imgs, labels_list, imgsz, center_range=(0.5, 1.5), fill=114):
-    """Assemble the uncropped ``2s×2s`` mosaic canvas. Returns ``(img4, labels_xyxy, (yc, xc))``."""
+def _mosaic4_canvas(imgs, labels_list, imgsz, center_range=(0.5, 1.5), fill=114, polys_list=None):
+    """Assemble the uncropped ``2s×2s`` mosaic canvas.
+
+    Returns ``(img4, labels_xyxy, poly4_or_None, (yc, xc))``. When ``polys_list`` (a list
+    of per-image polygon lists) is given, polygon vertices are offset into the mosaic and
+    returned flattened in the same object order as ``labels_xyxy``.
+    """
     assert len(imgs) == 4, "mosaic requires exactly 4 images"
     s = imgsz
     yc = int(random.uniform(s * center_range[0], s * center_range[1]))
     xc = int(random.uniform(s * center_range[0], s * center_range[1]))
     img4 = np.full((s * 2, s * 2, 3), fill, dtype=np.uint8)
     labels4 = []
+    poly4 = [] if polys_list is not None else None
     for i, (img, labels) in enumerate(zip(imgs, labels_list)):
         h, w = img.shape[:2]
         if i == 0:  # top-left
@@ -169,10 +177,16 @@ def _mosaic4_canvas(imgs, labels_list, imgsz, center_range=(0.5, 1.5), fill=114)
             lb[:, [1, 3]] += padw
             lb[:, [2, 4]] += padh
             labels4.append(lb)
+        if polys_list is not None:
+            for p in polys_list[i]:
+                p = np.asarray(p, np.float32).reshape(-1, 2).copy()
+                p[:, 0] += padw
+                p[:, 1] += padh
+                poly4.append(p)
     labels4 = np.concatenate(labels4, 0) if labels4 else np.zeros((0, 5), np.float32)
     if labels4.shape[0]:
         np.clip(labels4[:, 1:], 0, 2 * s, out=labels4[:, 1:])
-    return img4, labels4, (yc, xc)
+    return img4, labels4, poly4, (yc, xc)
 
 
 def _split(labels):
@@ -242,17 +256,24 @@ class Mosaic(BaseMixTransform):
 
     def _mix_transform(self, labels):
         mix = [labels] + labels["mix_labels"]
-        imgs, lab_list = [], []
+        has_poly = labels.get("polygons") is not None
+        imgs, lab_list, polys, dists = [], [], [], []
         for d in mix:
             cls, bboxes = _split(d)
             imgs.append(d["img"])
             lab_list.append(np.concatenate([cls, bboxes], 1) if cls.shape[0] else np.zeros((0, 5), np.float32))
-        img4, labels4, _ = _mosaic4_canvas(imgs, lab_list, self.imgsz)
+            if has_poly:
+                polys.append(d.get("polygons", []))
+                dists.append(np.asarray(d.get("distance", np.full(cls.shape[0], NO_DISTANCE, np.float32)), np.float32))
+        img4, labels4, poly4, _ = _mosaic4_canvas(imgs, lab_list, self.imgsz, polys_list=polys if has_poly else None)
         labels["img"] = img4
         labels["cls"] = labels4[:, 0:1]
         labels["bboxes"] = labels4[:, 1:5]
         labels["resized_shape"] = img4.shape[:2]
         labels["mosaic_border"] = self.border
+        if has_poly:
+            labels["polygons"] = poly4
+            labels["distance"] = np.concatenate(dists) if dists else np.zeros(0, np.float32)
         return labels
 
 
@@ -275,6 +296,11 @@ class MixUp(BaseMixTransform):
         c2, b2 = _split(labels2)
         labels["cls"] = np.concatenate([c1, c2], 0)
         labels["bboxes"] = np.concatenate([b1, b2], 0)
+        if labels.get("polygons") is not None:
+            labels["polygons"] = list(labels["polygons"]) + list(labels2.get("polygons", []))
+            d1 = np.asarray(labels.get("distance", np.full(c1.shape[0], NO_DISTANCE, np.float32)), np.float32)
+            d2 = np.asarray(labels2.get("distance", np.full(c2.shape[0], NO_DISTANCE, np.float32)), np.float32)
+            labels["distance"] = np.concatenate([d1, d2])
         return labels
 
 
@@ -291,6 +317,9 @@ class CopyPaste:
 
     def __call__(self, labels):
         cls, bboxes = _split(labels)
+        # Skip for polygon data (would add boxes without matching polygons).
+        if labels.get("polygons") is not None:
+            return labels
         if self.p == 0 or bboxes.shape[0] == 0 or random.uniform(0, 1) > self.p:
             return labels
         img = labels["img"]
@@ -387,6 +416,21 @@ class RandomPerspective:
         y = xy[:, [1, 3, 5, 7]]
         return np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1)), dtype=bboxes.dtype).reshape(4, n).T
 
+    def apply_polygons(self, polygons, M):
+        """Apply the affine/perspective matrix ``M`` to each ``(k, 2)`` polygon."""
+        out = []
+        for p in polygons:
+            p = np.asarray(p, np.float32).reshape(-1, 2)
+            if p.shape[0] == 0:
+                out.append(p)
+                continue
+            xy = np.ones((p.shape[0], 3), np.float32)
+            xy[:, :2] = p
+            xy = xy @ M.T
+            xy = xy[:, :2] / xy[:, 2:3] if self.perspective else xy[:, :2]
+            out.append(xy.astype(np.float32))
+        return out
+
     def __call__(self, labels):
         if self.pre_transform is not None and "mosaic_border" not in labels:
             labels = self.pre_transform(labels)
@@ -396,18 +440,29 @@ class RandomPerspective:
 
         img, M, scale = self.affine_transform(img, border)
         cls, bboxes = _split(labels)
+        polygons = labels.get("polygons")
+        distance = labels.get("distance")
         new_boxes = self.apply_bboxes(bboxes.astype(np.float32), M)
+        new_polys = self.apply_polygons(polygons, M) if polygons is not None else None
         if new_boxes.shape[0]:
             new_boxes[:, [0, 2]] = new_boxes[:, [0, 2]].clip(0, self.size[0])
             new_boxes[:, [1, 3]] = new_boxes[:, [1, 3]].clip(0, self.size[1])
             keep = box_candidates(box1=bboxes.T * scale, box2=new_boxes.T, area_thr=0.10)
             new_boxes = new_boxes[keep]
             cls = cls[keep]
+            if new_polys is not None:
+                new_polys = [new_polys[i] for i in np.nonzero(keep)[0]]
+                if distance is not None:
+                    distance = np.asarray(distance, np.float32)[keep]
 
         labels["img"] = img
         labels["cls"] = cls
         labels["bboxes"] = new_boxes
         labels["resized_shape"] = img.shape[:2]
+        if new_polys is not None:
+            labels["polygons"] = new_polys
+            if distance is not None:
+                labels["distance"] = distance
         return labels
 
 
@@ -436,20 +491,31 @@ class RandomFlip:
         img = labels["img"]
         h, w = img.shape[:2]
         cls, bboxes = _split(labels)
+        polygons = labels.get("polygons")
         if self.direction == "horizontal":
             img = np.ascontiguousarray(img[:, ::-1])
             if bboxes.shape[0]:
                 x1 = bboxes[:, 0].copy()
                 bboxes[:, 0] = w - bboxes[:, 2]
                 bboxes[:, 2] = w - x1
+            if polygons is not None:
+                for p in polygons:
+                    if p.shape[0]:
+                        p[:, 0] = w - p[:, 0]
         else:  # vertical
             img = np.ascontiguousarray(img[::-1])
             if bboxes.shape[0]:
                 y1 = bboxes[:, 1].copy()
                 bboxes[:, 1] = h - bboxes[:, 3]
                 bboxes[:, 3] = h - y1
+            if polygons is not None:
+                for p in polygons:
+                    if p.shape[0]:
+                        p[:, 1] = h - p[:, 1]
         labels["img"] = img
         labels["bboxes"] = bboxes
+        if polygons is not None:
+            labels["polygons"] = polygons
         return labels
 
 
@@ -519,6 +585,11 @@ class LetterBox:
         if bboxes.shape[0]:
             bboxes[:, [0, 2]] = bboxes[:, [0, 2]] * r + left
             bboxes[:, [1, 3]] = bboxes[:, [1, 3]] * r + top
+        if labels.get("polygons") is not None:
+            for p in labels["polygons"]:
+                if p.shape[0]:
+                    p[:, 0] = p[:, 0] * r + left
+                    p[:, 1] = p[:, 1] * r + top
         labels["img"] = img
         labels["bboxes"] = bboxes
         labels["cls"] = cls

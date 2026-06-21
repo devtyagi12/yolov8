@@ -15,6 +15,7 @@ from ..cfg import get_cfg
 from ..utils import LOGGER
 from ..utils.ops import make_divisible
 from .modules import C2f, Concat, Conv, Detect, SPPF
+from .poly_modules import DetectPolygon
 
 # Registry mapping config strings to module classes.
 _MODULES = {
@@ -23,8 +24,12 @@ _MODULES = {
     "SPPF": SPPF,
     "Concat": Concat,
     "Detect": Detect,
+    "DetectPolygon": DetectPolygon,
     "nn.Upsample": nn.Upsample,
 }
+
+# Heads that need the list of input channels appended to their args.
+_HEADS = (Detect, DetectPolygon)
 
 
 def parse_model(d, ch, verbose=True):
@@ -68,9 +73,10 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f]
         elif m_cls is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m_cls is Detect:
-            args.append([ch[x] for x in f])
+        elif m_cls in _HEADS:
+            # Detect(nc, ch[, ...]) / DetectPolygon(nc, ch, num_angles, angle_step, num_dist_blocks)
             args[0] = nc
+            args.insert(1, [ch[x] for x in f])
         else:
             c2 = ch[f]
 
@@ -112,8 +118,12 @@ class DetectionModel(nn.Module):
         m = self.model[-1]
         if isinstance(m, Detect):
             s = 256
-            forward = lambda x: self.forward(x)
-            m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])
+            was_training = self.training
+            self.train()  # ensure the head returns per-level feature maps
+            out = self.forward(torch.zeros(1, ch, s, s))
+            feats = out[0] if isinstance(out, tuple) else out  # DetectPolygon returns (feats, *extras)
+            m.stride = torch.tensor([s / x.shape[-2] for x in feats])
+            self.train(was_training)
             self.stride = m.stride
             m.bias_init()
         else:

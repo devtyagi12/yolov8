@@ -167,6 +167,20 @@ python tests/test_forward.py          # or: python -m pytest tests/ -q
 Covers: official parameter counts, forward output shape, bit-exact checkpoint
 round trip, the predict API, and loss convergence on an overfit batch.
 
+## Polygon + distance extension
+
+An extended head (`YOLOPolygon`) adds per-object **polygon** (star-shaped) and
+**distance** prediction on top of the standard box + class outputs, keeping the box
+and class branches unchanged. See **[POLYGON.md](POLYGON.md)** for the full design
+(datasets, parsers, `DetectPolygon` head, loss, decode, and the bbox-F1 metric).
+
+```python
+from yolo.poly_model import YOLOPolygon
+model = YOLOPolygon("yolov8s.pt", nc=3)
+model.train(poly_train="poly/images/train", dist_train="polyd/images/train", epochs=100)
+results = model.predict("img.jpg")   # bbox, cls, conf, distance, polygon
+```
+
 ## Notes & limitations
 
 - Detection only (no seg/pose/cls/obb).

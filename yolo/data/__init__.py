@@ -20,6 +20,15 @@ from .augment import (
 )
 from .dataset import YOLODataset
 from .build import build_dataloader
+from .poly_dataset import (
+    PolygonDataset,
+    PolyFormat,
+    V8DistanceParser,
+    V8ParserExtended,
+    build_merged_dataloader,
+    build_poly_dataloader,
+    v8_poly_transforms,
+)
 
 __all__ = [
     "DEFAULT_HYP",
@@ -40,4 +49,11 @@ __all__ = [
     "xyxy2xywhn",
     "YOLODataset",
     "build_dataloader",
+    "PolygonDataset",
+    "PolyFormat",
+    "V8ParserExtended",
+    "V8DistanceParser",
+    "build_merged_dataloader",
+    "build_poly_dataloader",
+    "v8_poly_transforms",
 ]
