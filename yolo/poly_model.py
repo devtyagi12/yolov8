@@ -62,8 +62,9 @@ class YOLOPolygon:
         return self.predict(source, **kwargs)
 
     # ------------------------------------------------------------------ training
-    def train(self, poly_train, dist_train, val_data=None, val_has_distance=False, epochs=100,
+    def train(self, poly_train=None, dist_train=None, val_data=None, val_has_distance=False, epochs=100,
               poly_batch=8, dist_batch=8, imgsz=640, **kwargs):
+        """Train on polygon data, polygon+distance data, or both (distance is optional)."""
         trainer = PolygonTrainer(self.model, poly_train=poly_train, dist_train=dist_train, val_data=val_data,
                                  val_has_distance=val_has_distance, epochs=epochs, poly_batch=poly_batch,
                                  dist_batch=dist_batch, imgsz=imgsz, device=self.device, **kwargs)

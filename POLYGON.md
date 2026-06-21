@@ -22,10 +22,20 @@ cls x1 y1 x2 y2 ... xn yn
 cls x1 y1 x2 y2 ... xn yn distance
 ```
 
-`n` (vertex count) may vary per object. The two datasets are concatenated into one
-loader with **a separate batch size each** (`build_merged_dataloader`); every batch
-is drawn entirely from one sub-dataset, and polygon-only objects carry a sentinel
-distance of `-10.0`.
+`n` (vertex count) may vary per object. The **distance dataset is optional** —
+`build_merged_dataloader` accepts any of three modes:
+
+| Mode | call |
+|------|------|
+| polygon only | `model.train(poly_train=poly_dir)` |
+| distance only | `model.train(dist_train=dist_dir)` |
+| both | `model.train(poly_train=poly_dir, dist_train=dist_dir)` |
+
+Datasets are concatenated into one loader with **a separate batch size each**; every
+batch is drawn entirely from one sub-dataset, and polygon-only objects carry a
+sentinel distance of `-10.0`. With no distance labels present the distance head
+simply receives no gradient (its loss is `0`) and box / class / polygon training is
+unaffected.
 
 ## 2. Parsing
 

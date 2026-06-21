@@ -23,8 +23,8 @@ class PolygonTrainer:
     def __init__(
         self,
         model,
-        poly_train,
-        dist_train,
+        poly_train=None,
+        dist_train=None,
         val_data=None,
         val_has_distance=False,
         epochs=100,

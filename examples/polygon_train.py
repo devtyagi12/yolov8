@@ -24,8 +24,8 @@ from yolo.poly_model import YOLOPolygon
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--poly", required=True, help="polygon-only images dir")
-    ap.add_argument("--dist", required=True, help="polygon+distance images dir")
+    ap.add_argument("--poly", default=None, help="polygon-only images dir (optional)")
+    ap.add_argument("--dist", default=None, help="polygon+distance images dir (optional)")
     ap.add_argument("--val", default=None, help="validation images dir")
     ap.add_argument("--val-has-distance", action="store_true")
     ap.add_argument("--weights", default="yolov8s", help="yolov8s or a .pt to seed box/cls weights")
@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
+    if not args.poly and not args.dist:
+        ap.error("provide at least one of --poly / --dist (distance is optional)")
 
     model = YOLOPolygon(args.weights, nc=args.nc, num_angles=args.num_angles, device=args.device)
     model.train(

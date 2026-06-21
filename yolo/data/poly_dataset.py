@@ -7,9 +7,13 @@ Label files contain one object per line::
 
 Polygon points are normalised to ``[0, 1]``; ``n`` (the vertex count) may vary per
 object.  There are no box coordinates — the bounding box is derived from the
-polygon.  The two parsers can be merged into a single dataloader (with a separate
-batch size per dataset) via :func:`build_merged_dataloader`; polygon-only samples
-carry a sentinel distance of ``-10.0``.
+polygon.
+
+The **distance dataset is optional**.  :func:`build_merged_dataloader` accepts a
+polygon-only path, a polygon+distance path, or both (each with its own batch size).
+Polygon-only samples carry a sentinel distance of ``-10.0`` and contribute no
+gradient to the distance head, so training on polygon labels alone is fully
+supported.
 """
 
 import random
@@ -336,8 +340,8 @@ class MixedBatchSampler:
 
 
 def build_merged_dataloader(
-    poly_path,
-    dist_path,
+    poly_path=None,
+    dist_path=None,
     imgsz=640,
     poly_batch=8,
     dist_batch=8,
@@ -350,10 +354,11 @@ def build_merged_dataloader(
     max_distance=DEFAULT_MAX_DISTANCE,
     shuffle=True,
 ):
-    """Concatenate a polygon-only dataset and a polygon+distance dataset into one loader.
+    """Build a polygon dataloader from a polygon-only set, a polygon+distance set, or both.
 
-    Each sub-dataset keeps its own batch size; every yielded batch is drawn entirely
-    from one sub-dataset (so distance validity is consistent within a batch).
+    The distance dataset is optional: pass ``poly_path`` only, ``dist_path`` only, or both.
+    Each sub-dataset keeps its own batch size; every yielded batch is drawn entirely from
+    one sub-dataset (so distance validity is consistent within a batch).
     """
     common = dict(
         imgsz=imgsz,
@@ -364,13 +369,21 @@ def build_merged_dataloader(
         min_distance=min_distance,
         max_distance=max_distance,
     )
-    ds_poly = V8ParserExtended(poly_path, **common)
-    ds_dist = V8DistanceParser(dist_path, **common)
-    concat = ConcatDataset([ds_poly, ds_dist])
-    concat.datasets_list = [ds_poly, ds_dist]  # keep references (e.g. for close_mosaic)
+    datasets, batch_sizes = [], []
+    if poly_path is not None:
+        datasets.append(V8ParserExtended(poly_path, **common))
+        batch_sizes.append(poly_batch)
+    if dist_path is not None:
+        datasets.append(V8DistanceParser(dist_path, **common))
+        batch_sizes.append(dist_batch)
+    if not datasets:
+        raise ValueError("build_merged_dataloader needs at least one of poly_path / dist_path")
+
+    concat = ConcatDataset(datasets)
+    concat.datasets_list = datasets  # keep references (e.g. for close_mosaic)
     sampler = MixedBatchSampler(
-        lengths=[len(ds_poly), len(ds_dist)],
-        batch_sizes=[poly_batch, dist_batch],
+        lengths=[len(d) for d in datasets],
+        batch_sizes=batch_sizes,
         shuffle=shuffle,
     )
     loader = DataLoader(

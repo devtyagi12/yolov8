@@ -115,6 +115,45 @@ def test_dataset_and_loss_step():
     assert batch["poly"].shape[1] == poly_vector_len(24)
 
 
+def test_polygon_only_distance_optional():
+    """Training with only polygon data (no distance dataset) must work; distance loss == 0."""
+    import cv2
+
+    from yolo.data.poly_dataset import build_merged_dataloader
+    from yolo.nn.poly_tasks import build_polygon_model
+    from yolo.utils.poly_loss import v8PolygonDistanceLoss
+
+    root = "/tmp/_t_poly_only"
+    os.makedirs(f"{root}/images/train", exist_ok=True)
+    os.makedirs(f"{root}/labels/train", exist_ok=True)
+    for i in range(4):
+        im = np.full((256, 256, 3), 40, np.uint8)
+        poly = np.array([[80, 70], [180, 80], [190, 180], [70, 175]], np.float32)
+        cv2.fillPoly(im, [poly.astype(np.int32)], (0, 0, 220))
+        cv2.imwrite(f"{root}/images/train/i{i}.jpg", im)
+        toks = ["0"] + [f"{v:.4f}" for v in (poly / 256.0).reshape(-1)]  # no trailing distance
+        open(f"{root}/labels/train/i{i}.txt", "w").write(" ".join(toks) + "\n")
+
+    # distance dataset omitted entirely
+    loader, concat = build_merged_dataloader(poly_path=f"{root}/images/train", dist_path=None,
+                                             imgsz=256, poly_batch=2, augment=True, workers=0)
+    assert len(concat.datasets_list) == 1
+    m = build_polygon_model("s", nc=1, num_angles=24, verbose=False).train()
+    crit = v8PolygonDistanceLoss(m)
+    batch = next(iter(loader))
+    loss, items = crit(m(batch["img"]), batch)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert float(items[4]) == 0.0  # distance-head loss is zero with no distance labels
+
+    # at least one source is required
+    try:
+        build_merged_dataloader(poly_path=None, dist_path=None)
+        raise AssertionError("expected ValueError when both paths are None")
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
     test_star_vector_length()
     test_polygon_to_star_picks_max_distance_per_bin()
@@ -123,4 +162,5 @@ if __name__ == "__main__":
     test_decode_polygons_inverts_angles()
     test_polygon_model_forward_shapes()
     test_dataset_and_loss_step()
+    test_polygon_only_distance_optional()
     print("All polygon tests passed.")
