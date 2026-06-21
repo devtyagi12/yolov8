@@ -37,7 +37,7 @@ def img2label_path(img_path):
 class YOLODataset(Dataset):
     """Detection dataset returning per-sample dicts ready for ``collate_fn``."""
 
-    def __init__(self, path, imgsz=640, augment=False, hyp=None, mosaic=None):
+    def __init__(self, path, imgsz=640, augment=False, hyp=None, mosaic=None, cache=False):
         self.imgsz = imgsz
         self.augment = augment
         self.hyp = {**DEFAULT_HYP, **(hyp or {})}
@@ -47,8 +47,12 @@ class YOLODataset(Dataset):
         if not self.im_files:
             raise FileNotFoundError(f"No images found under {path!r}")
         self.label_files = [img2label_path(f) for f in self.im_files]
+        # Image cache: False, "ram" (in-memory) or "disk" (.npy alongside images).
+        self.cache = cache if cache in ("ram", "disk") else ("ram" if cache is True else False)
+        self.ims = [None] * len(self.im_files) if self.cache == "ram" else None
         self.transforms = self.build_transforms()
-        LOGGER.info(f"YOLODataset: {len(self.im_files)} images from {path}")
+        LOGGER.info(f"YOLODataset: {len(self.im_files)} images from {path}"
+                    + (f" (cache={self.cache})" if self.cache else ""))
 
     # ------------------------------------------------------------------ setup
     @staticmethod
@@ -96,8 +100,8 @@ class YOLODataset(Dataset):
             lb = np.zeros((0, 5), dtype=np.float32)
         return lb  # (n, 5): cls, cx, cy, w, h (normalised)
 
-    def load_image_resized(self, idx):
-        """Load a BGR image resized so its long side equals ``imgsz`` plus pixel-xyxy labels."""
+    def _read_resized(self, idx):
+        """Read + resize an image (long side = imgsz). Returns (im, (h0, w0))."""
         im = cv2.imread(self.im_files[idx])
         if im is None:
             raise FileNotFoundError(f"Image not found: {self.im_files[idx]}")
@@ -106,6 +110,28 @@ class YOLODataset(Dataset):
         if r != 1:
             interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
             im = cv2.resize(im, (round(w0 * r), round(h0 * r)), interpolation=interp)
+        return im, (h0, w0)
+
+    def load_cached_image(self, idx):
+        """Return a (copy of a) resized image, using the RAM/disk cache when enabled."""
+        if self.cache == "ram":
+            if self.ims[idx] is None:
+                self.ims[idx] = self._read_resized(idx)
+            im, hw0 = self.ims[idx]
+            return im.copy(), hw0
+        if self.cache == "disk":
+            npz = Path(self.im_files[idx]).with_suffix(".cache.npz")
+            if npz.exists():
+                data = np.load(str(npz))
+                return data["im"], tuple(int(v) for v in data["hw0"])
+            im, hw0 = self._read_resized(idx)
+            np.savez(str(npz), im=im, hw0=np.array(hw0))
+            return im, hw0
+        return self._read_resized(idx)
+
+    def load_image_resized(self, idx):
+        """Load a BGR image resized so its long side equals ``imgsz`` plus pixel-xyxy labels."""
+        im, (h0, w0) = self.load_cached_image(idx)
         h, w = im.shape[:2]
 
         labels = self.load_labels(idx)

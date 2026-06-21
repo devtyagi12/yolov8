@@ -10,7 +10,8 @@ from ..utils.ops import non_max_suppression, xywh2xyxy
 class PolygonValidator:
     """Compute bounding-box precision / recall / F1 over a polygon dataloader."""
 
-    def __init__(self, model, dataloader, device="cpu", conf=0.25, iou=0.5, max_det=300):
+    def __init__(self, model, dataloader, device="cpu", conf=0.25, iou=0.5, max_det=300,
+                 names=None, num_angles=None, plot_samples=False, sample_prefix=None):
         self.model = model.to(device).eval()
         self.dataloader = dataloader
         self.device = device
@@ -18,16 +19,23 @@ class PolygonValidator:
         self.iou = iou  # IoU threshold for a true positive
         self.max_det = max_det
         self.nc = model.nc
+        self.names = names or getattr(model, "names", None) or {i: str(i) for i in range(self.nc)}
+        self.num_angles = num_angles or getattr(model, "num_angles", 24)
+        self.plot_samples = plot_samples
+        self.sample_prefix = sample_prefix
 
     @torch.no_grad()
     def __call__(self):
         tp = fp = fn = 0
-        for batch in self.dataloader:
+        for bi, batch in enumerate(self.dataloader):
             imgs = batch["img"].to(self.device)
             _, _, h, w = imgs.shape
             out = self.model(imgs)
             y = out[0] if isinstance(out, tuple) else out
             preds = non_max_suppression(y[:, : 4 + self.nc], self.conf, 0.45, max_det=self.max_det, nc=self.nc)
+
+            if bi == 0 and self.plot_samples and self.sample_prefix:
+                self._plot_samples(batch, imgs, preds)
 
             for si, pred in enumerate(preds):
                 idx = batch["batch_idx"] == si
@@ -64,3 +72,27 @@ class PolygonValidator:
         f1 = 2 * precision * recall / (precision + recall + 1e-9)
         LOGGER.info(f"   bbox P={precision:.3f}  R={recall:.3f}  F1={f1:.3f}  (TP={tp} FP={fp} FN={fn})")
         return {"precision": precision, "recall": recall, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
+
+    def _plot_samples(self, batch, imgs, preds):
+        """Save GT (bbox + star polygon) and prediction (bbox) grids for the first val batch."""
+        import cv2
+        import numpy as np
+        from pathlib import Path
+
+        from ..utils.plotting import draw_poly_star, image_grid, plot_detections
+
+        n = min(9, imgs.shape[0])
+        gt_tiles, pred_tiles = [], []
+        for si in range(n):
+            arr = (imgs[si].cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype("uint8")[:, :, ::-1]
+            arr = np.ascontiguousarray(arr)
+            idx = batch["batch_idx"] == si
+            gt_tiles.append(draw_poly_star(arr.copy(), batch["cls"][idx].numpy().reshape(-1),
+                                           batch["bboxes"][idx].numpy(), batch["poly"][idx].numpy(),
+                                           self.num_angles, self.names))
+            det = preds[si]
+            pb = det.cpu().numpy() if det is not None and len(det) else None
+            pred_tiles.append(plot_detections(arr.copy(), pb, names=self.names))
+        Path(self.sample_prefix).parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(f"{self.sample_prefix}_labels.jpg", image_grid(gt_tiles, cols=3))
+        cv2.imwrite(f"{self.sample_prefix}_pred.jpg", image_grid(pred_tiles, cols=3))

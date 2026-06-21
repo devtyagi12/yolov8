@@ -143,6 +143,18 @@ class DetectionModel(nn.Module):
             y.append(x if m.i in self.save else None)
         return x
 
+    def fuse(self):
+        """Fuse Conv2d + BatchNorm2d in every :class:`Conv` for faster inference."""
+        from .modules import Conv
+
+        for m in self.modules():
+            if isinstance(m, Conv) and hasattr(m, "bn"):
+                m.conv = fuse_conv_and_bn(m.conv, m.bn)
+                delattr(m, "bn")
+                m.forward = m.forward_fuse
+        self.is_fused = True
+        return self
+
     def load_state_dict_compat(self, state_dict, strict=False):
         """Load a (possibly remapped) state dict, reporting mismatches."""
         model_sd = self.state_dict()
@@ -157,6 +169,25 @@ class DetectionModel(nn.Module):
         if strict and (missing or unexpected):
             raise RuntimeError(f"Strict load failed: {len(missing)} missing, {len(unexpected)} unexpected")
         return self
+
+
+def fuse_conv_and_bn(conv, bn):
+    """Return a single Conv2d equivalent to ``conv`` followed by ``bn`` (inference only)."""
+    fused = nn.Conv2d(
+        conv.in_channels, conv.out_channels, kernel_size=conv.kernel_size, stride=conv.stride,
+        padding=conv.padding, dilation=conv.dilation, groups=conv.groups, bias=True,
+    ).requires_grad_(False).to(conv.weight.device)
+
+    # Fuse weights: W_fused = (gamma / sqrt(var + eps)) * W_conv
+    w_conv = conv.weight.clone().view(conv.out_channels, -1)
+    w_bn = torch.diag(bn.weight.div(torch.sqrt(bn.eps + bn.running_var)))
+    fused.weight.copy_(torch.mm(w_bn, w_conv).view(fused.weight.shape))
+
+    # Fuse bias: b_fused = beta + gamma * (b_conv - mean) / sqrt(var + eps)
+    b_conv = torch.zeros(conv.weight.shape[0], device=conv.weight.device) if conv.bias is None else conv.bias
+    b_bn = bn.bias - bn.weight.mul(bn.running_mean).div(torch.sqrt(bn.running_var + bn.eps))
+    fused.bias.copy_(torch.mm(w_bn, b_conv.reshape(-1, 1)).reshape(-1) + b_bn)
+    return fused
 
 
 def initialize_weights(model):

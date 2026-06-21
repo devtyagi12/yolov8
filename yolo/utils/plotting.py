@@ -1,5 +1,7 @@
 """Drawing utilities for detection results."""
 
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -90,6 +92,27 @@ def draw_normalized(im_bgr, cls, boxes_xywhn, names=None):
     return annotator.result()
 
 
+def draw_poly_star(im_bgr, cls, bboxes_xywhn, poly_star, num_angles, names=None, conf_thr=0.5):
+    """Draw normalised bbox + star-polygon outline for each object (polygon targets)."""
+    names = names or {}
+    h, w = im_bgr.shape[:2]
+    annotator = Annotator(np.ascontiguousarray(im_bgr))
+    cls = np.asarray(cls).reshape(-1)
+    bboxes_xywhn = np.asarray(bboxes_xywhn, dtype=np.float32).reshape(-1, 4)
+    poly_star = np.asarray(poly_star, dtype=np.float32).reshape(-1, 2 + 3 * num_angles)
+    for i in range(len(cls)):
+        c = int(cls[i])
+        col = color_for(c)
+        cx, cy, bw, bh = bboxes_xywhn[i]
+        annotator.box_label([(cx - bw / 2) * w, (cy - bh / 2) * h, (cx + bw / 2) * w, (cy + bh / 2) * h],
+                            names.get(c, str(c)), color=col)
+        verts = poly_star[i, 2:].reshape(num_angles, 3)
+        pts = [[verts[b, 0] * w, verts[b, 1] * h] for b in range(num_angles) if verts[b, 2] > conf_thr]
+        if len(pts) >= 3:
+            cv2.polylines(annotator.im, [np.array(pts, np.int32)], True, col, 2, cv2.LINE_AA)
+    return annotator.result()
+
+
 def image_grid(images, cols=2, pad=6, fill=30):
     """Tile equal-sized BGR images into a single grid image (row-major)."""
     if not images:
@@ -104,6 +127,171 @@ def image_grid(images, cols=2, pad=6, fill=30):
         x = pad + c * (w + pad)
         grid[y : y + h, x : x + w] = cv2.resize(im, (w, h)) if im.shape[:2] != (h, w) else im
     return grid
+
+
+def _mpl():
+    """Return a non-interactive matplotlib.pyplot, or None if unavailable."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        return plt
+    except ImportError:
+        return None
+
+
+def plot_pr_curve(px, py, ap, names, save_path="PR_curve.png"):
+    """Plot precision-recall curves (per class + mean) to ``save_path``."""
+    plt = _mpl()
+    if plt is None or py.size == 0:
+        return None
+    fig, ax = plt.subplots(1, 1, figsize=(9, 6), tight_layout=True)
+    py = py.T  # (1000, nc)
+    for i in range(py.shape[1]):
+        label = f"{names.get(i, i)} {ap[i, 0]:.3f}" if isinstance(names, dict) else f"{i} {ap[i,0]:.3f}"
+        ax.plot(px, py[:, i], linewidth=1, label=label)
+    ax.plot(px, py.mean(1), linewidth=3, color="navy", label=f"all classes {ap[:, 0].mean():.3f} mAP@0.5")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.legend(bbox_to_anchor=(1.04, 1), loc="upper left", fontsize=8)
+    ax.set_title("Precision-Recall Curve")
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    return save_path
+
+
+def plot_mc_curve(px, py, names, save_path, ylabel="Metric", xlabel="Confidence"):
+    """Plot a metric-vs-confidence curve (F1 / P / R) per class + mean."""
+    plt = _mpl()
+    if plt is None or py.size == 0:
+        return None
+    fig, ax = plt.subplots(1, 1, figsize=(9, 6), tight_layout=True)
+    for i in range(py.shape[0]):
+        label = f"{names.get(i, i)}" if isinstance(names, dict) else str(i)
+        ax.plot(px, py[i], linewidth=1, label=label)
+    mean = py.mean(0)
+    best = px[mean.argmax()]
+    ax.plot(px, mean, linewidth=3, color="navy", label=f"all classes {mean.max():.2f} at {best:.3f}")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.legend(bbox_to_anchor=(1.04, 1), loc="upper left", fontsize=8)
+    ax.set_title(f"{ylabel}-{xlabel} Curve")
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    return save_path
+
+
+def plot_confusion_matrix(matrix, names, save_path="confusion_matrix.png", normalize=True):
+    """Plot a confusion matrix heatmap (numbers shown for small class counts)."""
+    plt = _mpl()
+    if plt is None:
+        return None
+    array = matrix.copy()
+    if normalize:
+        array = array / (array.sum(0, keepdims=True) + 1e-9)
+    nc = array.shape[0] - 1
+    labels = [names.get(i, str(i)) if isinstance(names, dict) else str(i) for i in range(nc)] + ["background"]
+    fig, ax = plt.subplots(figsize=(8, 7), tight_layout=True)
+    im = ax.imshow(array, cmap="Blues", vmin=0)
+    fig.colorbar(im, ax=ax)
+    ax.set_xticks(range(nc + 1))
+    ax.set_yticks(range(nc + 1))
+    ax.set_xticklabels(labels, rotation=90, fontsize=7)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel("True")
+    ax.set_ylabel("Predicted")
+    ax.set_title("Confusion Matrix" + (" (normalized)" if normalize else ""))
+    if nc <= 30:
+        for i in range(nc + 1):
+            for j in range(nc + 1):
+                ax.text(j, i, f"{array[i, j]:.2f}", ha="center", va="center", fontsize=6,
+                        color="white" if array[i, j] > array.max() / 2 else "black")
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    return save_path
+
+
+def plot_results(csv_path, save_path=None):
+    """Plot per-epoch training/validation curves from a results CSV to ``results.png``."""
+    plt = _mpl()
+    if plt is None:
+        return None
+    import csv as _csv
+
+    rows, header = [], None
+    with open(csv_path) as f:
+        reader = _csv.reader(f)
+        header = next(reader)
+        for r in reader:
+            rows.append([float(x) for x in r])
+    if not rows:
+        return None
+    data = np.array(rows)
+    cols = [c for c in range(len(header)) if header[c] != "epoch"]
+    epoch_idx = header.index("epoch") if "epoch" in header else 0
+    n = len(cols)
+    ncol = min(5, n)
+    nrow = (n + ncol - 1) // ncol
+    fig, ax = plt.subplots(nrow, ncol, figsize=(3 * ncol, 2.5 * nrow), tight_layout=True, squeeze=False)
+    for i, c in enumerate(cols):
+        a = ax[i // ncol][i % ncol]
+        a.plot(data[:, epoch_idx], data[:, c], marker=".", linewidth=1.5)
+        a.set_title(header[c], fontsize=9)
+        a.set_xlabel("epoch", fontsize=7)
+    for j in range(n, nrow * ncol):
+        ax[j // ncol][j % ncol].axis("off")
+    save_path = save_path or str(Path(csv_path).with_name("results.png"))
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return save_path
+
+
+def plot_label_histogram(classes, names, save_path):
+    """Plot a class-instance histogram (labels.png) from a list of class ids."""
+    plt = _mpl()
+    if plt is None or len(classes) == 0:
+        return None
+    classes = np.asarray(classes).astype(int)
+    nc = int(classes.max()) + 1
+    counts = np.bincount(classes, minlength=nc)
+    labels = [names.get(i, str(i)) if isinstance(names, dict) else str(i) for i in range(nc)]
+    fig, ax = plt.subplots(figsize=(max(6, nc * 0.5), 4), tight_layout=True)
+    ax.bar(range(nc), counts, color="steelblue")
+    ax.set_xticks(range(nc))
+    ax.set_xticklabels(labels, rotation=90, fontsize=7)
+    ax.set_ylabel("instances")
+    ax.set_title("Class distribution")
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return save_path
+
+
+def feature_visualization(x, save_path, n=16):
+    """Save a grid of the first ``n`` channels of a feature map tensor ``x`` (1,C,H,W)."""
+    plt = _mpl()
+    if plt is None:
+        return None
+    if x.ndim != 4:
+        return None
+    c = min(n, x.shape[1])
+    blocks = x[0, :c].detach().cpu().float()
+    cols = min(c, 8)
+    rows = (c + cols - 1) // cols
+    fig, ax = plt.subplots(rows, cols, figsize=(cols, rows), tight_layout=True, squeeze=False)
+    for i in range(rows * cols):
+        a = ax[i // cols][i % cols]
+        a.axis("off")
+        if i < c:
+            a.imshow(blocks[i], cmap="viridis")
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    return save_path
 
 
 def plot_detections(im, boxes, names=None):

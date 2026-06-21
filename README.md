@@ -181,6 +181,28 @@ model.train(poly_train="poly/images/train", dist_train="polyd/images/train", epo
 results = model.predict("img.jpg")   # bbox, cls, conf, distance, polygon
 ```
 
+## Deployment, training & inference features
+
+| Area | Features |
+|------|----------|
+| Export | `model.export("torchscript" / "onnx" / "int8")` — Conv+BN fuse, ONNX (legacy exporter, optional dynamic axes), INT8 ONNX via ONNX Runtime (~4× smaller). `model.fuse()` for faster inference. |
+| Training | AMP (CUDA), multi-GPU (`device="0,1"`, DataParallel), EMA, resume (`resume=path`), cosine LR (`cos_lr=True`), image caching (`cache="ram"`/`"disk"`), best/last checkpoints. |
+| Validation | Per-class P/R/F1 + mAP@0.5 / mAP@0.5:0.95 table, confusion matrix, PR/F1/P/R curves, per-image speed, `metrics.json` (`model.val(..., plots=True, save_json=True)`). |
+| Inference | Image / array / **directory** / glob sources, `save`, `save_txt`, `save_conf`, `show`, and backbone **feature-map visualization** (`model.predict(src, save=True, save_txt=True, visualize=True)`). |
+| Logging | TensorBoard (`tensorboard=True`), `results.csv` + `results.png` curves, `labels.png` class histogram, `train_batch0.jpg`. |
+
+```python
+from yolo import YOLO
+m = YOLO("yolov8n.pt")
+m.train("data/images/train", data_val="data/images/val", epochs=100,
+        cos_lr=True, ema=True, amp=True, cache="ram", tensorboard=True)   # Steps 2 & 5
+m.val("data/images/val", plots=True, save_json=True)                      # Step 3
+m.predict("data/images/test", save=True, save_txt=True, visualize=True)   # Step 4
+m.export("onnx", dynamic=True)                                            # Step 1
+```
+
+CLI: `examples/export.py`, and `examples/predict.py` (`--save --save-txt --visualize`).
+
 ## Notes & limitations
 
 - Detection only (no seg/pose/cls/obb).

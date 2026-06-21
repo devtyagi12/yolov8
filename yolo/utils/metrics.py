@@ -60,49 +60,129 @@ def compute_ap(recall, precision):
     return ap, mpre, mrec
 
 
+def smooth(y, f=0.05):
+    """Box-filter smoothing of a 1D array (used to pick a stable max-F1 confidence)."""
+    nf = round(len(y) * f * 2) // 2 + 1
+    p = np.ones(nf // 2)
+    yp = np.concatenate((p * y[0], y, p * y[-1]), 0)
+    return np.convolve(yp, np.ones(nf) / nf, mode="valid")
+
+
 def ap_per_class(tp, conf, pred_cls, target_cls, eps=1e-16):
-    """Compute the average precision per class.
+    """Compute per-class average precision plus P/R/F1 curves over a confidence sweep.
 
     Args:
-        tp (np.ndarray): (n, 10) boolean true-positive matrix across IoU thresholds.
+        tp (np.ndarray): (n, niou) boolean true-positive matrix across IoU thresholds.
         conf (np.ndarray): (n,) predicted confidences.
         pred_cls (np.ndarray): (n,) predicted classes.
         target_cls (np.ndarray): (m,) ground-truth classes.
     Returns:
-        dict with per-class precision/recall/ap and summary mAP values.
+        dict with summary mAP, per-class P/R/F1/AP arrays, and curve data for plotting.
     """
     i = np.argsort(-conf)
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
     unique_classes, nt = np.unique(target_cls, return_counts=True)
     nc = unique_classes.shape[0]
 
+    px = np.linspace(0, 1, 1000)  # confidence sweep for curves
     ap = np.zeros((nc, tp.shape[1]))
-    p = np.zeros(nc)
-    r = np.zeros(nc)
+    p_curve = np.zeros((nc, 1000))
+    r_curve = np.zeros((nc, 1000))
+    prec_values = []
     for ci, c in enumerate(unique_classes):
         i = pred_cls == c
-        n_l = nt[ci]  # labels
-        n_p = i.sum()  # predictions
+        n_l, n_p = nt[ci], int(i.sum())
         if n_p == 0 or n_l == 0:
             continue
         fpc = (1 - tp[i]).cumsum(0)
         tpc = tp[i].cumsum(0)
         recall = tpc / (n_l + eps)
         precision = tpc / (tpc + fpc)
+        # interpolate P/R against the confidence sweep (negative conf -> ascending)
+        r_curve[ci] = np.interp(-px, -conf[i], recall[:, 0], left=0)
+        p_curve[ci] = np.interp(-px, -conf[i], precision[:, 0], left=1)
         for j in range(tp.shape[1]):
-            ap[ci, j], _, _ = compute_ap(recall[:, j], precision[:, j])
-        r[ci] = recall[-1, 0]
-        p[ci] = precision[-1, 0]
+            ap[ci, j], mpre, mrec = compute_ap(recall[:, j], precision[:, j])
+            if j == 0:
+                prec_values.append(np.interp(px, mrec, mpre))
+    prec_values = np.array(prec_values) if prec_values else np.zeros((0, 1000))
+
+    f1_curve = 2 * p_curve * r_curve / (p_curve + r_curve + eps)
+    # pick the confidence that maximises mean F1
+    idx = smooth(f1_curve.mean(0), 0.1).argmax() if nc else 0
+    p, r, f1 = p_curve[:, idx], r_curve[:, idx], f1_curve[:, idx]
 
     return {
         "ap": ap,
         "ap50": ap[:, 0] if ap.size else ap,
+        "ap_class": ap.mean(1) if ap.size else ap,  # per-class mAP@0.5:0.95
         "map50": ap[:, 0].mean() if ap.size else 0.0,
         "map": ap.mean() if ap.size else 0.0,
+        "p": p,
+        "r": r,
+        "f1": f1,
         "mp": p.mean() if nc else 0.0,
         "mr": r.mean() if nc else 0.0,
-        "classes": unique_classes,
+        "mf1": f1.mean() if nc else 0.0,
+        "nt": nt,
+        "classes": unique_classes.astype(int),
+        "conf_at_max_f1": float(px[idx]) if nc else 0.0,
+        "curves": {"px": px, "p": p_curve, "r": r_curve, "f1": f1_curve, "prec": prec_values},
     }
+
+
+class ConfusionMatrix:
+    """Detection confusion matrix (``nc + 1`` rows/cols; the extra index is background)."""
+
+    def __init__(self, nc, conf=0.25, iou_thres=0.45):
+        self.nc = nc
+        self.conf = conf
+        self.iou_thres = iou_thres
+        self.matrix = np.zeros((nc + 1, nc + 1))  # rows: predicted, cols: ground truth
+
+    def process_batch(self, detections, gt_bboxes, gt_cls):
+        """Accumulate one image. ``detections`` (n,6) xyxy,conf,cls; ``gt_bboxes`` (m,4) xyxy."""
+        if detections is not None and len(detections):
+            detections = detections[detections[:, 4] > self.conf]
+        gt_cls = gt_cls.astype(int)
+        if detections is None or len(detections) == 0:
+            for gc in gt_cls:
+                self.matrix[self.nc, gc] += 1  # all GT become false negatives (background pred)
+            return
+        det_cls = detections[:, 5].astype(int)
+        if len(gt_bboxes) == 0:
+            for dc in det_cls:
+                self.matrix[dc, self.nc] += 1  # background false positives
+            return
+
+        iou = box_iou(torch.as_tensor(gt_bboxes), torch.as_tensor(detections[:, :4])).numpy()
+        x = np.where(iou > self.iou_thres)
+        if x[0].shape[0]:
+            matches = np.stack(x, 1)
+            v = iou[x[0], x[1]]
+            matches = matches[v.argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        else:
+            matches = np.zeros((0, 2), int)
+        matched_gt = matches[:, 0].astype(int)
+        matched_det = matches[:, 1].astype(int)
+        m_lookup = {int(g): int(d) for g, d in matches[:, :2].astype(int)} if len(matches) else {}
+
+        for gi, gc in enumerate(gt_cls):
+            if gi in matched_gt:
+                self.matrix[det_cls[m_lookup[gi]], gc] += 1  # TP (or class confusion)
+            else:
+                self.matrix[self.nc, gc] += 1  # missed GT
+        for di, dc in enumerate(det_cls):
+            if di not in matched_det:
+                self.matrix[dc, self.nc] += 1  # background FP
+
+    def tp_fp(self):
+        tp = self.matrix.diagonal()[:-1]
+        fp = self.matrix[:-1].sum(1) - tp
+        return tp, fp
+
 
 
 def match_predictions(pred_classes, true_classes, iou, iou_thresholds):

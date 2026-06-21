@@ -43,6 +43,7 @@ class PolygonTrainer:
         close_mosaic=10,
         project="runs/polygon",
         save=True,
+        plots=True,
     ):
         self.model = model.to(device)
         self.device = device
@@ -52,6 +53,7 @@ class PolygonTrainer:
         self.warmup_epochs = warmup_epochs
         self.close_mosaic = close_mosaic
         self.save = save
+        self.plots = plots
         self.project = Path(project)
 
         self.train_loader, self.train_concat = build_merged_dataloader(
@@ -81,6 +83,23 @@ class PolygonTrainer:
             if "momentum" in pg:
                 pg["momentum"] = np.interp(ni, xi, [0.8, 0.937])
 
+    def _draw_train_batch(self, batch, path):
+        """Save a 3x3 grid of a polygon training batch (bbox + star polygon) per epoch."""
+        import cv2
+
+        from ..utils.plotting import draw_poly_star, image_grid
+
+        n = min(9, batch["img"].shape[0])
+        tiles = []
+        for k in range(n):
+            arr = (batch["img"][k].cpu().numpy().transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)[:, :, ::-1]
+            idx = batch["batch_idx"] == k
+            tiles.append(draw_poly_star(np.ascontiguousarray(arr), batch["cls"][idx].numpy().reshape(-1),
+                                        batch["bboxes"][idx].numpy(), batch["poly"][idx].numpy(),
+                                        self.model.num_angles, self.model.names))
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(path), image_grid(tiles, cols=3))
+
     def train(self):
         LOGGER.info(f"Starting polygon training for {self.epochs} epochs on {self.device}...")
         for epoch in range(self.epochs):
@@ -91,6 +110,11 @@ class PolygonTrainer:
                     ds.close_mosaic()
             mloss = torch.zeros(5, device=self.device)
             for i, batch in enumerate(self.train_loader):
+                if i == 0 and self.plots:  # per-epoch train batch visualization
+                    try:
+                        self._draw_train_batch(batch, self.project / "train_batches" / f"train_epoch{epoch + 1:03d}.jpg")
+                    except Exception as e:
+                        LOGGER.info(f"train batch plot skipped: {e}")
                 self._warmup(i + self.nb * epoch, epoch)
                 imgs = batch["img"].to(self.device, non_blocking=True)
                 loss, items = self.criterion(self.model(imgs), batch)
@@ -105,14 +129,20 @@ class PolygonTrainer:
                 f"poly={mloss[3]:.4f} dist={mloss[4]:.4f}  lr={self.optimizer.param_groups[0]['lr']:.5f}"
             )
             if self.val_loader is not None:
-                self.validate()
+                self.validate(epoch)
 
         if self.save:
             self._save()
         return self.model
 
-    def validate(self):
-        metrics = PolygonValidator(self.model, self.val_loader, device=self.device)()
+    def validate(self, epoch=None):
+        prefix = None
+        if self.plots and epoch is not None:
+            prefix = str(self.project / "val_batches" / f"val_epoch{epoch + 1:03d}")
+        metrics = PolygonValidator(
+            self.model, self.val_loader, device=self.device, names=self.model.names,
+            num_angles=self.model.num_angles, plot_samples=self.plots and epoch is not None, sample_prefix=prefix,
+        )()
         self.model.train()
         return metrics
 

@@ -73,12 +73,18 @@ class YOLO:
         return model
 
     # ------------------------------------------------------------------ inference
-    def predict(self, source, conf=0.25, iou=0.45, imgsz=640, max_det=300):
-        """Run detection inference. Returns a list of ``Results``."""
+    def predict(self, source, conf=0.25, iou=0.45, imgsz=640, max_det=300, save=False, save_txt=False,
+                save_conf=False, show=False, visualize=False, save_dir="runs/predict"):
+        """Run detection inference (image / array / list / directory / glob).
+
+        Returns a list of ``Results``; optionally saves annotated images, YOLO-format
+        txt labels, and backbone feature-map grids.
+        """
         predictor = DetectionPredictor(
             self.model, device=self.device, imgsz=imgsz, conf=conf, iou=iou, max_det=max_det, names=self.names
         )
-        return predictor(source)
+        return predictor(source, save=save, save_txt=save_txt, save_conf=save_conf, show=show,
+                         visualize=visualize, save_dir=save_dir)
 
     def __call__(self, source, **kwargs):
         return self.predict(source, **kwargs)
@@ -99,12 +105,13 @@ class YOLO:
         self.model = trainer.train()
         return self.model
 
-    def val(self, data, batch=16, imgsz=640, conf=0.001, iou=0.7):
-        """Validate the model on a YOLO-format dataset, returning mAP metrics."""
+    def val(self, data, batch=16, imgsz=640, conf=0.001, iou=0.7, save_dir=None, plots=False, save_json=False):
+        """Validate the model on a YOLO-format dataset, returning rich metrics."""
         from .data.build import build_dataloader
 
         loader = build_dataloader(data, imgsz=imgsz, batch=batch, augment=False, shuffle=False)
-        validator = DetectionValidator(self.model, loader, device=self.device, conf=conf, iou=iou)
+        validator = DetectionValidator(self.model, loader, device=self.device, conf=conf, iou=iou,
+                                       names=self.names, save_dir=save_dir, plots=plots, save_json=save_json)
         return validator()
 
     # ------------------------------------------------------------------ io
@@ -123,6 +130,14 @@ class YOLO:
         LOGGER.info(f"YOLO detection model: {self.model.nc} classes, {n_params:,} params ({n_grad:,} trainable)")
         return n_params
 
-    @property
     def fuse(self):
-        return self.model
+        """Fuse Conv+BN layers in-place for faster inference."""
+        self.model.fuse()
+        return self
+
+    def export(self, format="torchscript", file=None, imgsz=640, half=False, **kwargs):
+        """Export the model to ``torchscript`` / ``onnx`` / ``int8``."""
+        from .engine.exporter import Exporter
+
+        exporter = Exporter(self.model, imgsz=imgsz, device="cpu", half=half)
+        return exporter.export(format=format, file=file, **kwargs)
